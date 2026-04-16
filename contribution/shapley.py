@@ -1,13 +1,13 @@
 """
-Round-level Shapley value estimation using Monte Carlo permutation sampling
-following the SVRFL paper approach.
+Round-level Shapley value estimation using Monte Carlo permutation sampling.
 
-Value function:  v(S) = F(w_g, D_v) - F(w_S, D_v)
-  where F is cross-entropy loss on the server validation set,
-  w_S = w_g + (server_lr / |S|) * sum_{i in S} delta_i
+Supports both overall and **per-class** Shapley values.
 
-Marginal contribution of client i added to coalition S:
-  v(S ∪ {i}) - v(S) = F(w_S) - F(w_{S∪{i}})  (loss decrease)
+Per-class value function for class c:
+  v_c(S) = F_c(w_g, D_v) - F_c(w_S, D_v)
+where F_c is cross-entropy loss averaged over validation samples of class c.
+
+Overall Shapley = weighted average of per-class Shapley (by class frequency).
 """
 
 from collections import OrderedDict
@@ -40,23 +40,114 @@ def _build_coalition_params(
 
 
 @torch.no_grad()
-def _evaluate_loss(model, state_dict: OrderedDict, data_loader, device="cpu") -> float:
-    """Evaluate cross-entropy loss of model with given state_dict."""
+def _evaluate_per_class_loss(
+    model, state_dict: OrderedDict, data_loader, num_classes: int, device="cpu"
+) -> np.ndarray:
+    """Evaluate per-class average cross-entropy loss.
+    Returns ndarray of shape (num_classes,).
+    """
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
-    criterion = nn.CrossEntropyLoss()
-    total_loss = 0.0
-    total = 0
+    criterion = nn.CrossEntropyLoss(reduction="none")
+
+    class_loss_sum = np.zeros(num_classes, dtype=np.float64)
+    class_count = np.zeros(num_classes, dtype=np.int64)
+
     for X, y in data_loader:
         X, y = X.to(device), y.to(device)
-        out = model(X)
-        loss = criterion(out, y)
-        total_loss += loss.item() * X.size(0)
-        total += X.size(0)
-    return total_loss / max(total, 1)
+        per_sample_loss = criterion(model(X), y)
+        for c in range(num_classes):
+            mask = y == c
+            if mask.any():
+                class_loss_sum[c] += per_sample_loss[mask].sum().item()
+                class_count[c] += mask.sum().item()
+
+    safe_count = np.maximum(class_count, 1)
+    return class_loss_sum / safe_count
 
 
+def _class_weights_from_loader(val_loader, num_classes: int) -> np.ndarray:
+    """Compute class frequency weights from a DataLoader."""
+    counts = np.zeros(num_classes, dtype=np.int64)
+    for _, y in val_loader:
+        for c in range(num_classes):
+            counts[c] += (y == c).sum().item()
+    total = counts.sum()
+    return counts / max(total, 1)
+
+
+def estimate_round_shapley_per_class(
+    model,
+    updates: dict,
+    global_state_dict: OrderedDict,
+    val_loader,
+    num_classes: int = 20,
+    server_lr: float = 1.0,
+    num_mc_samples: int = 30,
+    device: str = "cpu",
+) -> dict:
+    """
+    Estimate per-class Shapley values for one FL round using
+    Monte Carlo permutation sampling.
+
+    Same number of forward passes as the overall version, but returns
+    per-class granularity.
+
+    Returns dict of client_id -> np.ndarray of shape (num_classes,).
+    """
+    client_ids = list(updates.keys())
+    if len(client_ids) == 0:
+        return {}
+
+    shapley_sums = {cid: np.zeros(num_classes, dtype=np.float64) for cid in client_ids}
+
+    base_pc = _evaluate_per_class_loss(
+        model, global_state_dict, val_loader, num_classes, device
+    )
+
+    for _ in range(num_mc_samples):
+        perm = np.random.permutation(client_ids).tolist()
+        coalition = []
+        prev_pc = base_pc.copy()
+
+        for cid in perm:
+            coalition.append(cid)
+            coal_params = _build_coalition_params(
+                global_state_dict, updates, coalition, server_lr
+            )
+            curr_pc = _evaluate_per_class_loss(
+                model, coal_params, val_loader, num_classes, device
+            )
+            shapley_sums[cid] += (prev_pc - curr_pc)
+            prev_pc = curr_pc
+
+    return {cid: shapley_sums[cid] / num_mc_samples for cid in client_ids}
+
+
+def per_class_to_overall(per_class_sv: dict, class_weights: np.ndarray) -> dict:
+    """Derive overall Shapley from per-class Shapley via weighted sum."""
+    return {cid: float(np.dot(class_weights, sv)) for cid, sv in per_class_sv.items()}
+
+
+def compute_class_metrics(per_class_sv: dict) -> dict:
+    """Compute the two per-class detection metrics for each client.
+
+    Returns dict of client_id -> {
+        'class_sv_variance': variance of per-class SV,
+        'positive_class_sv_sum': sum of positive per-class SVs,
+    }
+    """
+    metrics = {}
+    for cid, sv_arr in per_class_sv.items():
+        metrics[cid] = {
+            "class_sv_variance": float(np.var(sv_arr)),
+            "positive_class_sv_sum": float(np.sum(sv_arr[sv_arr > 0])),
+        }
+    return metrics
+
+
+# Backward-compatible wrapper
 def estimate_round_shapley(
     model,
     updates: dict,
@@ -66,40 +157,13 @@ def estimate_round_shapley(
     num_mc_samples: int = 30,
     device: str = "cpu",
 ) -> dict:
+    """Overall Shapley values (backward compatible).
+    Returns dict of client_id -> float.
     """
-    Estimate per-client Shapley values for one FL round using
-    Monte Carlo permutation sampling (SVRFL SVEstimate).
-
-    For each sampled permutation, walk through clients in order and
-    record each client's marginal contribution (= loss decrease when
-    that client is added to the growing coalition).
-
-    Returns dict of client_id -> shapley_value (float).
-    """
-    client_ids = list(updates.keys())
-    n = len(client_ids)
-    if n == 0:
-        return {}
-
-    shapley_sums = {cid: 0.0 for cid in client_ids}
-
-    # Loss of the global model (empty-coalition baseline)
-    base_loss = _evaluate_loss(model, global_state_dict, val_loader, device)
-
-    for _ in range(num_mc_samples):
-        perm = np.random.permutation(client_ids).tolist()
-        coalition = []
-        prev_loss = base_loss
-
-        for cid in perm:
-            coalition.append(cid)
-            coal_params = _build_coalition_params(
-                global_state_dict, updates, coalition, server_lr
-            )
-            curr_loss = _evaluate_loss(model, coal_params, val_loader, device)
-            # Marginal contribution = loss decrease from adding this client
-            shapley_sums[cid] += (prev_loss - curr_loss)
-            prev_loss = curr_loss
-
-    shapley_values = {cid: shapley_sums[cid] / num_mc_samples for cid in client_ids}
-    return shapley_values
+    pc_sv = estimate_round_shapley_per_class(
+        model, updates, global_state_dict, val_loader,
+        num_classes=20, server_lr=server_lr,
+        num_mc_samples=num_mc_samples, device=device,
+    )
+    weights = _class_weights_from_loader(val_loader, 20)
+    return per_class_to_overall(pc_sv, weights)

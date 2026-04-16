@@ -25,10 +25,10 @@ class Config:
 
     # Attack: "none", "dfr", "sdfr", "afr"
     attack_type: str = "none"
-    malicious_ratio: float = 0.3
-    dfr_noise_scale: float = 0.001
-    sdfr_scale: float = 0.5
-    afr_noise_scale: float = 0.0005
+    malicious_ratio: float = 0.4
+    dfr_noise_scale: float = 0.01
+    sdfr_scale: float = 2.0
+    afr_noise_scale: float = 0.005
 
     # Shapley
     num_mc_samples: int = 30

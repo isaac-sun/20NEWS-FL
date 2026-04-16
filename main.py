@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Federated Learning on 20 Newsgroups with Free-Rider Attacks,
-Shapley-Value Contribution Estimation (SVRFL-style), and Detection.
+Per-Class Shapley-Value Contribution Estimation, and Detection.
 
 Runs four experiments:
   1. baseline (no attack)
@@ -9,15 +9,20 @@ Runs four experiments:
   3. SDFR (Scaled Delta Free-Rider)
   4. AFR  (Advanced Free-Rider)
 
+Detection metrics (per-class Shapley derived):
+  - class_sv_variance:      variance of per-class SV across 20 classes
+  - positive_class_sv_sum:  sum of positive per-class SV values
+
 Outputs:
   results/experiment_results.xlsx   — per-round Shapley details + summary
   results/test_accuracy.png         — accuracy curves
   results/test_loss.png             — loss curves
   results/shapley_comparison.png    — Shapley honest-vs-malicious
+  results/class_metrics.png         — per-class variance & positive sum
 """
 
 import os
-os.environ.setdefault("OMP_NUM_THREADS", "1")  # avoid KMeans crash on macOS
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import copy
 
@@ -40,8 +45,12 @@ from fl.aggregation import fedavg_aggregate
 from attacks.dfr import dfr_attack
 from attacks.sdfr import sdfr_attack
 from attacks.afr import afr_attack
-from contribution.shapley import estimate_round_shapley
-from detection.free_rider_detection import compute_feature_values, detect_free_riders, detect_afr_by_delta_similarity
+from contribution.shapley import (
+    estimate_round_shapley_per_class,
+    per_class_to_overall,
+    compute_class_metrics,
+    _class_weights_from_loader,
+)
 from detection.utility_score import UtilityScoreTracker
 from utils.partition import iid_partition, non_iid_partition
 from utils.export import export_results
@@ -113,9 +122,12 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
     test_losses: list[float] = []
     participation_counts = {cid: 0 for cid in range(config.num_clients)}
     cumulative_sv = {cid: 0.0 for cid in range(config.num_clients)}
+    cumulative_class_var = {cid: [] for cid in range(config.num_clients)}
+    cumulative_pos_sum = {cid: [] for cid in range(config.num_clients)}
 
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
-    eval_model = model_fn()  # re-used for Shapley evaluation
+    eval_model = model_fn()
+    class_weights = _class_weights_from_loader(val_loader, config.num_classes)
 
     # ── FL rounds ────────────────────────────────────────────────────────
     for round_t in tqdm(range(config.num_rounds), desc=config.experiment_name):
@@ -136,30 +148,21 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
             else:
                 updates[cid] = clients[cid].train(global_sd)
 
-        # ── Shapley estimation ───────────────────────────────────────────
-        shapley_vals = estimate_round_shapley(
+        # ── per-class Shapley estimation ─────────────────────────────────
+        per_class_sv = estimate_round_shapley_per_class(
             eval_model, updates, global_sd, val_loader,
+            num_classes=config.num_classes,
             server_lr=config.server_lr,
             num_mc_samples=config.num_mc_samples,
             device=config.device,
         )
 
+        # derive overall Shapley and per-class metrics
+        shapley_vals = per_class_to_overall(per_class_sv, class_weights)
+        class_metrics = compute_class_metrics(per_class_sv)
+
         # ── utility scores ───────────────────────────────────────────────
         utility_tracker.update(shapley_vals)
-
-        # ── feature-value detection ──────────────────────────────────────
-        feat_vals = compute_feature_values(updates, shapley_vals, global_sd)
-        suspected = detect_free_riders(feat_vals, config.detection_threshold_h)
-
-        # ── AFR detection via delta cosine similarity ────────────────────
-        if prev_sd is not None:
-            prev_delta = {k: global_sd[k] - prev_sd[k] for k in global_sd}
-            afr_suspected = detect_afr_by_delta_similarity(
-                updates, prev_delta, config.afr_cosine_threshold
-            )
-            for cid, flag in afr_suspected.items():
-                if flag:
-                    suspected[cid] = True
 
         # ── aggregate (standard FedAvg) ──────────────────────────────────
         new_sd = fedavg_aggregate(global_sd, updates, config.server_lr)
@@ -180,6 +183,13 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
             sv = shapley_vals.get(cid, 0.0)
             cumulative_sv[cid] += sv
             pc = participation_counts[cid]
+
+            cm = class_metrics.get(cid, {})
+            cls_var = cm.get("class_sv_variance", 0.0)
+            pos_sum = cm.get("positive_class_sv_sum", 0.0)
+            cumulative_class_var[cid].append(cls_var)
+            cumulative_pos_sum[cid].append(pos_sum)
+
             round_details.append({
                 "experiment_name": config.experiment_name,
                 "attack_type": config.attack_type,
@@ -190,7 +200,10 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
                 "round_shapley_value": sv,
                 "cumulative_shapley_value": cumulative_sv[cid],
                 "mean_shapley_value": cumulative_sv[cid] / pc,
-                "free_rider_flag": suspected.get(cid, False),
+                "class_sv_variance": cls_var,
+                "positive_class_sv_sum": pos_sum,
+                "mean_class_sv_variance": float(np.mean(cumulative_class_var[cid])),
+                "mean_positive_class_sv_sum": float(np.mean(cumulative_pos_sum[cid])),
                 "utility_score": utility_tracker.scores.get(cid, 0.0),
             })
 
@@ -205,6 +218,10 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
 
     def _avg_cum_sv(ids):
         return float(np.mean([cumulative_sv[c] for c in ids])) if ids else 0.0
+
+    def _avg_metric(ids, store):
+        vals = [float(np.mean(store[c])) if store[c] else 0.0 for c in ids]
+        return float(np.mean(vals)) if vals else 0.0
 
     avg_sv_h = _avg_mean_sv(honest_ids)
     avg_sv_m = _avg_mean_sv(list(malicious_ids))
@@ -222,7 +239,11 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
         "avg_cumulative_shapley_honest": avg_cum_h,
         "avg_cumulative_shapley_malicious": avg_cum_m,
         "shapley_gap_honest_vs_malicious": avg_sv_h - avg_sv_m,
-        "attack_effective": "",  # filled in post-hoc
+        "avg_class_sv_variance_honest": _avg_metric(honest_ids, cumulative_class_var),
+        "avg_class_sv_variance_malicious": _avg_metric(list(malicious_ids), cumulative_class_var),
+        "avg_positive_class_sv_sum_honest": _avg_metric(honest_ids, cumulative_pos_sum),
+        "avg_positive_class_sv_sum_malicious": _avg_metric(list(malicious_ids), cumulative_pos_sum),
+        "attack_effective": "",
         "notes": "",
     }
 
@@ -234,6 +255,8 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
 def generate_plots(curves: dict, round_details: list, results_dir: str):
     """Generate and save all experiment plots."""
     os.makedirs(results_dir, exist_ok=True)
+    df = pd.DataFrame(round_details)
+    attack_names = ["attack_dfr", "attack_sdfr", "attack_afr"]
 
     # ── 1. test accuracy ─────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -266,12 +289,8 @@ def generate_plots(curves: dict, round_details: list, results_dir: str):
     plt.close(fig)
 
     # ── 3. shapley comparison ────────────────────────────────────────────
-    df = pd.DataFrame(round_details)
-    attack_names = ["attack_dfr", "attack_sdfr", "attack_afr"]
-
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
 
-    # 3a: round shapley over time
     for exp_name in attack_names:
         sub = df[df["experiment_name"] == exp_name]
         if sub.empty:
@@ -287,9 +306,9 @@ def generate_plots(curves: dict, round_details: list, results_dir: str):
     axes[0].set_ylabel("Mean Round Shapley Value")
     axes[0].set_title("Round-Level Shapley: Honest vs Malicious")
     axes[0].legend(fontsize=8)
+    axes[0].axhline(y=0, color="k", linewidth=0.5)
     axes[0].grid(True)
 
-    # 3b: cumulative shapley bar chart
     bar_labels, bar_vals, bar_colors = [], [], []
     for exp_name in attack_names:
         sub = df[df["experiment_name"] == exp_name]
@@ -313,11 +332,100 @@ def generate_plots(curves: dict, round_details: list, results_dir: str):
         axes[1].set_xticklabels(bar_labels, fontsize=8)
     axes[1].set_ylabel("Avg Cumulative Shapley Value")
     axes[1].set_title("Cumulative Shapley: Honest vs Malicious")
+    axes[1].axhline(y=0, color="k", linewidth=0.5)
     axes[1].grid(True, axis="y")
 
     fig.tight_layout()
     fig.savefig(
         os.path.join(results_dir, "shapley_comparison.png"),
+        dpi=150, bbox_inches="tight",
+    )
+    plt.close(fig)
+
+    # ── 4. per-class metrics: variance & positive sum ────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+    # 4a: class_sv_variance over rounds
+    for exp_name in attack_names:
+        sub = df[df["experiment_name"] == exp_name]
+        if sub.empty:
+            continue
+        honest = sub[~sub["is_malicious"]].groupby("round")["class_sv_variance"].mean()
+        mal = sub[sub["is_malicious"]].groupby("round")["class_sv_variance"].mean()
+        label = exp_name.replace("attack_", "").upper()
+        axes[0, 0].plot(honest.index, honest.values, label=f"{label} honest")
+        axes[0, 0].plot(mal.index, mal.values, ls="--", label=f"{label} malicious")
+    axes[0, 0].set_xlabel("Round")
+    axes[0, 0].set_ylabel("Per-Class SV Variance")
+    axes[0, 0].set_title("Per-Class Shapley Variance Over Rounds")
+    axes[0, 0].legend(fontsize=7)
+    axes[0, 0].grid(True)
+
+    # 4b: positive_class_sv_sum over rounds
+    for exp_name in attack_names:
+        sub = df[df["experiment_name"] == exp_name]
+        if sub.empty:
+            continue
+        honest = sub[~sub["is_malicious"]].groupby("round")["positive_class_sv_sum"].mean()
+        mal = sub[sub["is_malicious"]].groupby("round")["positive_class_sv_sum"].mean()
+        label = exp_name.replace("attack_", "").upper()
+        axes[0, 1].plot(honest.index, honest.values, label=f"{label} honest")
+        axes[0, 1].plot(mal.index, mal.values, ls="--", label=f"{label} malicious")
+    axes[0, 1].set_xlabel("Round")
+    axes[0, 1].set_ylabel("Positive Per-Class SV Sum")
+    axes[0, 1].set_title("Positive Per-Class SV Sum Over Rounds")
+    axes[0, 1].legend(fontsize=7)
+    axes[0, 1].grid(True)
+
+    # 4c: bar chart of mean class_sv_variance
+    bar_labels, bar_vals, bar_colors = [], [], []
+    for exp_name in attack_names:
+        sub = df[df["experiment_name"] == exp_name]
+        if sub.empty:
+            continue
+        last_round = sub["round"].max()
+        last = sub[sub["round"] == last_round]
+        label = exp_name.replace("attack_", "").upper()
+        h_v = last[~last["is_malicious"]]["mean_class_sv_variance"].mean()
+        m_v = last[last["is_malicious"]]["mean_class_sv_variance"].mean()
+        bar_labels += [f"{label}\nhonest", f"{label}\nmalicious"]
+        bar_vals += [h_v, m_v]
+        bar_colors += ["steelblue", "coral"]
+    if bar_labels:
+        x_pos = np.arange(len(bar_labels))
+        axes[1, 0].bar(x_pos, bar_vals, color=bar_colors, alpha=0.8)
+        axes[1, 0].set_xticks(x_pos)
+        axes[1, 0].set_xticklabels(bar_labels, fontsize=8)
+    axes[1, 0].set_ylabel("Mean Per-Class SV Variance")
+    axes[1, 0].set_title("Avg Per-Class SV Variance: Honest vs Malicious")
+    axes[1, 0].grid(True, axis="y")
+
+    # 4d: bar chart of mean positive_class_sv_sum
+    bar_labels, bar_vals, bar_colors = [], [], []
+    for exp_name in attack_names:
+        sub = df[df["experiment_name"] == exp_name]
+        if sub.empty:
+            continue
+        last_round = sub["round"].max()
+        last = sub[sub["round"] == last_round]
+        label = exp_name.replace("attack_", "").upper()
+        h_p = last[~last["is_malicious"]]["mean_positive_class_sv_sum"].mean()
+        m_p = last[last["is_malicious"]]["mean_positive_class_sv_sum"].mean()
+        bar_labels += [f"{label}\nhonest", f"{label}\nmalicious"]
+        bar_vals += [h_p, m_p]
+        bar_colors += ["steelblue", "coral"]
+    if bar_labels:
+        x_pos = np.arange(len(bar_labels))
+        axes[1, 1].bar(x_pos, bar_vals, color=bar_colors, alpha=0.8)
+        axes[1, 1].set_xticks(x_pos)
+        axes[1, 1].set_xticklabels(bar_labels, fontsize=8)
+    axes[1, 1].set_ylabel("Mean Positive Per-Class SV Sum")
+    axes[1, 1].set_title("Avg Positive Per-Class SV Sum: Honest vs Malicious")
+    axes[1, 1].grid(True, axis="y")
+
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(results_dir, "class_metrics.png"),
         dpi=150, bbox_inches="tight",
     )
     plt.close(fig)
@@ -338,10 +446,8 @@ def main():
         num_classes=20,
         max_features=10000,
         val_ratio=0.1,
-        iid=False,
-        detection_threshold_h=20.0,
-        afr_cosine_threshold=0.9,
-        malicious_ratio=0.3,
+        iid=True,
+        malicious_ratio=0.4,
         num_mc_samples=30,
         seed=42,
         device="cpu",
@@ -387,7 +493,7 @@ def main():
     baseline_acc = all_summaries[0]["final_global_accuracy"]
     for s in all_summaries[1:]:
         drop = baseline_acc - s["final_global_accuracy"]
-        s["attack_effective"] = drop > 0.02  # >2pp accuracy drop
+        s["attack_effective"] = drop > 0.02
         s["notes"] = f"accuracy drop vs baseline: {drop:.4f}"
 
     # ── export ───────────────────────────────────────────────────────────
@@ -399,18 +505,22 @@ def main():
     logger.info(f"Plots saved to {base.results_dir}/")
 
     # ── print summary table ──────────────────────────────────────────────
-    print("\n" + "=" * 72)
+    print("\n" + "=" * 100)
     print("EXPERIMENT SUMMARY")
-    print("=" * 72)
+    print("=" * 100)
     for s in all_summaries:
         print(
             f"  {s['experiment_name']:<22s}  "
             f"acc={s['final_global_accuracy']:.4f}  "
             f"loss={s['final_global_loss']:.4f}  "
             f"SV_h={s['avg_round_shapley_honest']:.6f}  "
-            f"SV_m={s['avg_round_shapley_malicious']:.6f}"
+            f"SV_m={s['avg_round_shapley_malicious']:.6f}  "
+            f"Var_h={s.get('avg_class_sv_variance_honest',0):.2e}  "
+            f"Var_m={s.get('avg_class_sv_variance_malicious',0):.2e}  "
+            f"PosSum_h={s.get('avg_positive_class_sv_sum_honest',0):.6f}  "
+            f"PosSum_m={s.get('avg_positive_class_sv_sum_malicious',0):.6f}"
         )
-    print("=" * 72)
+    print("=" * 100)
 
 
 if __name__ == "__main__":
