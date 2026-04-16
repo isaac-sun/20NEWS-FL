@@ -49,6 +49,6 @@ class FLClient:
         local_sd = model.state_dict()
         update = OrderedDict()
         for key in global_state_dict:
-            update[key] = local_sd[key].cpu() - global_state_dict[key].cpu()
+            update[key] = local_sd[key] - global_state_dict[key]
 
         return update
