@@ -33,9 +33,7 @@ class Config:
     # Shapley
     num_mc_samples: int = 30
 
-    # Detection
-    detection_threshold_h: float = 20.0
-    afr_cosine_threshold: float = 0.9
+    # Utility
     utility_alpha: float = 0.5
 
     # General
