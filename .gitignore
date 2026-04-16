@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+results/*.xlsx
+results/*.png
+*.egg-info/
+.venv/
+venv/
+.env
+*.pt
+*.pth
