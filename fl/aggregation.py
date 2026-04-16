@@ -23,7 +23,10 @@ def fedavg_aggregate(
 
     new_state_dict = OrderedDict()
     for key in global_state_dict:
-        agg_update = sum(weights[cid] * updates[cid][key] for cid in client_ids)
+        device = global_state_dict[key].device
+        agg_update = sum(
+            weights[cid] * updates[cid][key].to(device) for cid in client_ids
+        )
         new_state_dict[key] = global_state_dict[key] + server_lr * agg_update
 
     return new_state_dict
