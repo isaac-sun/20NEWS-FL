@@ -26,9 +26,11 @@ class Config:
     # Attack: "none", "dfr", "sdfr", "afr"
     attack_type: str = "none"
     malicious_ratio: float = 0.4
-    dfr_noise_scale: float = 0.01
-    sdfr_scale: float = 2.0
-    afr_noise_scale: float = 0.005
+    # DFR: phi(t) = sigma * t^{-1}  (paper, gamma=1)
+    dfr_sigma: float = 0.5
+    # SDFR: no manual scale; derived from 3-round global delta window
+    # AFR: noise calibrated by model dimension d and E(cos beta)
+    afr_noise_scale: float = 0.1
 
     # Shapley
     num_mc_samples: int = 30

@@ -1,5 +1,5 @@
 import copy
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 import numpy as np
 from torch.utils.data import DataLoader
@@ -15,6 +15,9 @@ class FLServer:
         self.config = config
         self.global_state_dict = copy.deepcopy(model.state_dict())
         self.prev_global_state_dict = None
+        # Sliding window of up to 3 previous global state dicts (oldest first)
+        # Used by SDFR / AFR attacks for 3-round delta estimation
+        self.global_history: deque = deque(maxlen=3)
         self.val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
         self.test_loader = DataLoader(test_dataset, batch_size=config.batch_size)
 
@@ -35,6 +38,10 @@ class FLServer:
     def update_global_model(self, new_state_dict: OrderedDict):
         """Update the global model with new parameters."""
         self.prev_global_state_dict = self.global_state_dict
+        # Push current state into 3-round history before overwriting
+        self.global_history.append(
+            OrderedDict({k: v.clone() for k, v in self.global_state_dict.items()})
+        )
         self.global_state_dict = OrderedDict(
             {k: v.clone() for k, v in new_state_dict.items()}
         )
