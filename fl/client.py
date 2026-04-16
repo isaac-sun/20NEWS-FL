@@ -29,6 +29,11 @@ class FLClient:
         model.train()
 
         optimizer = torch.optim.Adam(model.parameters(), lr=self.config.local_lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.config.local_epochs,
+            eta_min=self.config.local_lr * 0.1,
+        )
         criterion = nn.CrossEntropyLoss()
 
         for _ in range(self.config.local_epochs):
@@ -38,6 +43,7 @@ class FLClient:
                 loss = criterion(model(X), y)
                 loss.backward()
                 optimizer.step()
+            scheduler.step()
 
         # Compute update: delta = local - global
         local_sd = model.state_dict()

@@ -34,7 +34,8 @@ class Config:
     num_mc_samples: int = 30
 
     # Detection
-    detection_threshold_h: float = 200.0
+    detection_threshold_h: float = 20.0
+    afr_cosine_threshold: float = 0.9
     utility_alpha: float = 0.5
 
     # General

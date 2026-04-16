@@ -41,7 +41,7 @@ from attacks.dfr import dfr_attack
 from attacks.sdfr import sdfr_attack
 from attacks.afr import afr_attack
 from contribution.shapley import estimate_round_shapley
-from detection.free_rider_detection import compute_feature_values, detect_free_riders
+from detection.free_rider_detection import compute_feature_values, detect_free_riders, detect_afr_by_delta_similarity
 from detection.utility_score import UtilityScoreTracker
 from utils.partition import iid_partition, non_iid_partition
 from utils.export import export_results
@@ -150,6 +150,16 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
         # ── feature-value detection ──────────────────────────────────────
         feat_vals = compute_feature_values(updates, shapley_vals, global_sd)
         suspected = detect_free_riders(feat_vals, config.detection_threshold_h)
+
+        # ── AFR detection via delta cosine similarity ────────────────────
+        if prev_sd is not None:
+            prev_delta = {k: global_sd[k] - prev_sd[k] for k in global_sd}
+            afr_suspected = detect_afr_by_delta_similarity(
+                updates, prev_delta, config.afr_cosine_threshold
+            )
+            for cid, flag in afr_suspected.items():
+                if flag:
+                    suspected[cid] = True
 
         # ── aggregate (standard FedAvg) ──────────────────────────────────
         new_sd = fedavg_aggregate(global_sd, updates, config.server_lr)
@@ -328,6 +338,9 @@ def main():
         num_classes=20,
         max_features=10000,
         val_ratio=0.1,
+        iid=False,
+        detection_threshold_h=20.0,
+        afr_cosine_threshold=0.9,
         malicious_ratio=0.3,
         num_mc_samples=30,
         seed=42,

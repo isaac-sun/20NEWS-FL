@@ -93,3 +93,33 @@ def detect_free_riders(feature_values: dict, threshold_h: float = 200.0) -> dict
         suspected = {cid: False for cid in cids}
 
     return suspected
+
+
+def detect_afr_by_delta_similarity(
+    updates: dict,
+    prev_global_delta: dict,
+    cosine_threshold: float = 0.9,
+) -> dict:
+    """
+    Detect AFR-style free-riders by measuring cosine similarity between
+    each client's update and the previous global model delta
+    (prev_delta = w_t - w_{t-1}).
+
+    AFR clients copy the previous global delta almost verbatim, so their
+    cosine similarity to prev_delta is near 1.0, while honest clients
+    produce diverse updates with much lower similarity.
+
+    Returns dict of client_id -> bool (True = suspected AFR).
+    """
+    prev_flat = _flatten(prev_global_delta)
+    if prev_flat.norm() < 1e-10:
+        return {cid: False for cid in updates}
+
+    suspected = {}
+    for cid, update in updates.items():
+        update_flat = _flatten(update)
+        sim = F.cosine_similarity(
+            update_flat.unsqueeze(0), prev_flat.unsqueeze(0)
+        ).item()
+        suspected[cid] = bool(sim > cosine_threshold)
+    return suspected
