@@ -42,9 +42,9 @@ from models.mlp import MLP
 from fl.client import FLClient
 from fl.server import FLServer
 from fl.aggregation import fedavg_aggregate
-from attacks.dfr import dfr_attack
+from attacks.dfr import dfr_attack, estimate_dfr_sigma
 from attacks.sdfr import sdfr_attack
-from attacks.afr import afr_attack
+from attacks.afr import afr_attack, AFRState
 from contribution.shapley import (
     estimate_round_shapley_per_class,
     per_class_to_overall,
@@ -65,18 +65,50 @@ def create_model(input_dim, config):
 
 
 def _apply_attack(attack_type, global_sd, global_history, config,
-                  round_num=1, n_participants=8):
-    """Generate a free-rider update according to attack_type."""
+                  round_num=1, dfr_sigma_est=None,
+                  afr_state=None, val_loss_t=None):
+    """Generate a free-rider update according to attack_type.
+
+    Returns (update, metadata_dict).
+    metadata_dict may contain:
+      - 'afr_base_norm': float  (for AFR state tracking)
+    """
     if attack_type == "dfr":
-        return dfr_attack(global_sd, sigma=config.dfr_sigma,
-                          round_num=round_num, gamma=config.dfr_gamma)
+        # Use estimated sigma if available and auto-estimation is enabled
+        sigma = config.dfr_sigma
+        if config.dfr_estimate_sigma and dfr_sigma_est is not None:
+            sigma = dfr_sigma_est
+        update = dfr_attack(global_sd, sigma=sigma,
+                            round_num=round_num, gamma=config.dfr_gamma)
+        return update, {}
+
     elif attack_type == "sdfr":
-        return sdfr_attack(global_sd, global_history)
+        update = sdfr_attack(global_sd, global_history)
+        return update, {}
+
     elif attack_type == "afr":
-        return afr_attack(global_sd, global_history,
-                          n_participants=n_participants,
-                          e_cos_beta=config.afr_e_cos_beta,
-                          noisy_frac=config.afr_noisy_frac)
+        # Determine E[cos β]: dynamic estimation > override > default
+        e_cos_beta = 0.0
+        if config.afr_e_cos_beta_override is not None:
+            e_cos_beta = config.afr_e_cos_beta_override
+        elif afr_state is not None and val_loss_t is not None:
+            e_cos_beta = afr_state.get_e_cos_beta(val_loss_t)
+
+        # |E[U_f(θ)]|: EMA from past rounds
+        mean_base_norm = None
+        if afr_state is not None:
+            mean_base_norm = afr_state.get_mean_base_norm()
+
+        # n = total clients in the FL system (paper's n)
+        update, base_norm = afr_attack(
+            global_sd, global_history,
+            n_total=config.num_clients,
+            e_cos_beta=e_cos_beta,
+            mean_base_norm=mean_base_norm,
+            noisy_frac=config.afr_noisy_frac,
+        )
+        return update, {"afr_base_norm": base_norm}
+
     raise ValueError(f"Unknown attack type: {attack_type}")
 
 
@@ -130,6 +162,10 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
     cumulative_class_var = {cid: [] for cid in range(config.num_clients)}
     cumulative_pos_sum = {cid: [] for cid in range(config.num_clients)}
 
+    # ── attack state trackers ───────────────────────────────────────────
+    dfr_sigma_est = None          # estimated sigma for DFR
+    afr_state = AFRState(ema_alpha=config.afr_base_norm_ema_alpha) if config.attack_type == "afr" else None
+
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
     eval_model = model_fn()
     class_weights = _class_weights_from_loader(val_loader, config.num_classes)
@@ -142,17 +178,44 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
         global_sd = server.get_global_state_dict()
         global_history = list(server.global_history)
 
+        # ── pre-attack: DFR sigma estimation (once, from initial delta) ──
+        if config.attack_type == "dfr" and dfr_sigma_est is None and config.dfr_estimate_sigma:
+            est = estimate_dfr_sigma(global_sd, global_history)
+            if est is not None:
+                dfr_sigma_est = est
+                logger.info(f"DFR sigma auto-estimated: {dfr_sigma_est:.6f}")
+
+        # ── pre-attack: validation loss for AFR state ────────────────────
+        val_loss_t = None
+        if config.attack_type == "afr":
+            val_loss_t, _ = server.evaluate_val()
+            if afr_state is not None and afr_state.val_loss_init is None:
+                afr_state.val_loss_init = val_loss_t
+                logger.info(f"AFR val_loss_init set: {val_loss_t:.4f}")
+
         # collect updates
         updates = {}
+        afr_base_norms_this_round = []
         for cid in selected:
             participation_counts[cid] += 1
             if cid in malicious_ids:
-                updates[cid] = _apply_attack(
+                update, meta = _apply_attack(
                     config.attack_type, global_sd, global_history, config,
-                    round_num=round_t + 1, n_participants=len(selected),
+                    round_num=round_t + 1,
+                    dfr_sigma_est=dfr_sigma_est,
+                    afr_state=afr_state,
+                    val_loss_t=val_loss_t,
                 )
+                updates[cid] = update
+                if "afr_base_norm" in meta:
+                    afr_base_norms_this_round.append(meta["afr_base_norm"])
             else:
                 updates[cid] = clients[cid].train(global_sd)
+
+        # ── post-attack: update AFR state ────────────────────────────────
+        if afr_state is not None and val_loss_t is not None and afr_base_norms_this_round:
+            avg_base_norm = float(np.mean(afr_base_norms_this_round))
+            afr_state.update(val_loss_t, avg_base_norm)
 
         # ── per-class Shapley estimation ─────────────────────────────────
         per_class_sv = estimate_round_shapley_per_class(

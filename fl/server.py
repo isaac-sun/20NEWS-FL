@@ -51,3 +51,8 @@ class FLServer:
         """Evaluate global model on test set. Returns (loss, accuracy)."""
         self.model.load_state_dict(self.global_state_dict)
         return evaluate_model(self.model, self.test_loader, self.config.device)
+
+    def evaluate_val(self):
+        """Evaluate global model on validation set. Returns (loss, accuracy)."""
+        self.model.load_state_dict(self.global_state_dict)
+        return evaluate_model(self.model, self.val_loader, self.config.device)
