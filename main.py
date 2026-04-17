@@ -64,14 +64,19 @@ def create_model(input_dim, config):
     return MLP(input_dim, config.hidden_dim, config.num_classes).to(config.device)
 
 
-def _apply_attack(attack_type, global_sd, prev_sd, config):
+def _apply_attack(attack_type, global_sd, global_history, config,
+                  round_num=1, n_participants=8):
     """Generate a free-rider update according to attack_type."""
     if attack_type == "dfr":
-        return dfr_attack(global_sd, config.dfr_noise_scale)
+        return dfr_attack(global_sd, sigma=config.dfr_sigma,
+                          round_num=round_num, gamma=config.dfr_gamma)
     elif attack_type == "sdfr":
-        return sdfr_attack(global_sd, prev_sd, config.sdfr_scale)
+        return sdfr_attack(global_sd, global_history)
     elif attack_type == "afr":
-        return afr_attack(global_sd, prev_sd, config.afr_noise_scale)
+        return afr_attack(global_sd, global_history,
+                          n_participants=n_participants,
+                          e_cos_beta=config.afr_e_cos_beta,
+                          noisy_frac=config.afr_noisy_frac)
     raise ValueError(f"Unknown attack type: {attack_type}")
 
 
@@ -135,7 +140,7 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
             config.num_clients, config.participation_ratio
         )
         global_sd = server.get_global_state_dict()
-        prev_sd = server.prev_global_state_dict
+        global_history = list(server.global_history)
 
         # collect updates
         updates = {}
@@ -143,7 +148,8 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
             participation_counts[cid] += 1
             if cid in malicious_ids:
                 updates[cid] = _apply_attack(
-                    config.attack_type, global_sd, prev_sd, config
+                    config.attack_type, global_sd, global_history, config,
+                    round_num=round_t + 1, n_participants=len(selected),
                 )
             else:
                 updates[cid] = clients[cid].train(global_sd)

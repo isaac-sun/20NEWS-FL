@@ -26,11 +26,17 @@ class Config:
     # Attack: "none", "dfr", "sdfr", "afr"
     attack_type: str = "none"
     malicious_ratio: float = 0.4
-    # DFR: phi(t) = sigma * t^{-1}  (paper, gamma=1)
+
+    # DFR: g = sigma * t^{-gamma} * N(0,I)  — [11] Fraboni et al.
     dfr_sigma: float = 0.5
-    # SDFR: no manual scale; derived from 3-round global delta window
-    # AFR: noise calibrated by model dimension d and E(cos beta)
-    afr_noise_scale: float = 0.1
+    dfr_gamma: float = 1.0
+
+    # SDFR: U_f = ||delta_t||/||delta_prev|| * delta_t  — [12] Zhu et al.
+    # No manual parameters; derived from consecutive global deltas.
+
+    # AFR: SDFR + calibrated sparse noise  — [12] Zhu et al.
+    afr_e_cos_beta: float = 0.5     # expected pairwise cosine sim of honest updates
+    afr_noisy_frac: float = 0.1     # fraction of params to perturb (d/D)
 
     # Shapley
     num_mc_samples: int = 30
