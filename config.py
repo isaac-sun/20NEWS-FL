@@ -53,6 +53,11 @@ class Config:
     alie_clip_prob_eps: float = 1e-6   # clipping eps for p in z_max
     alie_debug_log: bool = True        # emit per-round ALIE diagnostics
 
+    # Force all malicious clients into every round's selection.
+    # Standard in FL attack papers — prevents z_max=0 from too few
+    # malicious participants.  Only affects poisoning experiments.
+    force_malicious_participation: bool = True
+
     # Label-Flipping (LF): source_class → target_class relabeling
     # For 20 Newsgroups: source=0 (alt.atheism) → target=10 (sci.crypt)
     lf_source_class: int = 0

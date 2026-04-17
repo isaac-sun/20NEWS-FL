@@ -184,6 +184,27 @@ def run_poisoning_experiment(
         selected = server.select_clients(
             config.num_clients, config.participation_ratio
         )
+
+        # Force all malicious clients into the selection if configured.
+        # This is standard in FL attack papers — without it, random
+        # selection with participation_ratio=0.5 yields too few malicious
+        # per round, making z_max ≈ 0 for ALIE (attack becomes a no-op).
+        if config.force_malicious_participation and malicious_ids:
+            selected_set = set(selected)
+            missing_mal = malicious_ids - selected_set
+            if missing_mal:
+                # Replace random honest clients to keep |selected| constant
+                honest_in_sel = [c for c in selected if c not in malicious_ids]
+                n_replace = min(len(missing_mal), len(honest_in_sel))
+                for c in sorted(missing_mal)[:n_replace]:
+                    removed = honest_in_sel.pop()
+                    selected_set.discard(removed)
+                    selected_set.add(c)
+                # If not enough honest to replace, just add remaining
+                for c in sorted(missing_mal)[n_replace:]:
+                    selected_set.add(c)
+                selected = sorted(selected_set)
+
         global_sd = server.get_global_state_dict()
 
         # ── Phase 1: collect honest/clean updates from ALL selected ──────
