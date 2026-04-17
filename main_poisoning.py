@@ -28,6 +28,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
@@ -73,7 +74,11 @@ def run_poisoning_experiment(
     Run one full FL experiment with optional poisoning attack.
 
     Supports: "none", "sf", "alie", "lf"
-    Returns: (round_details, summary, test_accs, test_losses, asr_list, tacc_list)
+    Returns: (round_details, summary, test_accs, test_losses,
+              asr_list, tacc_list, per_client_final, cumulative_per_class_sv,
+              debug_info)
+    where debug_info is a dict with keys: "alie_rounds", "lf_rounds", "sf_rounds",
+        "lf_client_stats"
     """
     set_seed(config.seed)
     logger.info(
@@ -116,15 +121,34 @@ def run_poisoning_experiment(
 
     # ── prepare label-flipped datasets for LF malicious clients ──────────
     lf_datasets = {}
+    lf_client_stats = {}  # {cid: {"n_source": int, "n_flipped": int}}
     if config.attack_type == "lf":
+        logger.info(
+            f"LF attack setup: dataset=20Newsgroups, num_classes={config.num_classes}, "
+            f"source_class={config.lf_source_class}, target_class={config.lf_target_class}"
+        )
         for cid in malicious_ids:
-            lf_datasets[cid] = create_label_flipped_subset(
+            lf_ds, n_source = create_label_flipped_subset(
                 train_dataset, partition[cid],
                 config.lf_source_class, config.lf_target_class,
             )
+            lf_datasets[cid] = lf_ds
+            lf_client_stats[cid] = {
+                "n_source": n_source,
+                "n_total": len(partition[cid]),
+            }
+            if n_source < 5:
+                logger.warning(
+                    f"LF: client {cid} has only {n_source} source-class "
+                    f"samples (class {config.lf_source_class}). "
+                    "Attack may be ineffective for this client."
+                )
         logger.info(
-            f"LF attack: {len(malicious_ids)} malicious clients, "
-            f"source={config.lf_source_class} → target={config.lf_target_class}"
+            f"LF: {len(malicious_ids)} malicious clients | "
+            + ", ".join(
+                f"client {c}: {lf_client_stats[c]['n_source']}/{lf_client_stats[c]['n_total']} source samples"
+                for c in sorted(malicious_ids)
+            )
         )
 
     # ── tracking structures ──────────────────────────────────────────────
@@ -145,6 +169,11 @@ def run_poisoning_experiment(
         for cid in range(config.num_clients)
     }
 
+    # Debug tracking lists
+    alie_debug_log: list[dict] = []  # one entry per round where ALIE is active
+    lf_round_log: list[dict] = []    # one entry per round where LF metrics evaluated
+    sf_debug_log: list[dict] = []    # one entry per round where SF is active
+
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size)
     eval_model = model_fn()
@@ -158,8 +187,6 @@ def run_poisoning_experiment(
         global_sd = server.get_global_state_dict()
 
         # ── Phase 1: collect honest/clean updates from ALL selected ──────
-        # For SF/ALIE we need honest updates first; for LF the malicious
-        # clients train on poisoned data directly.
         updates = {}
         benign_selected = [c for c in selected if c not in malicious_ids]
         malicious_selected = [c for c in selected if c in malicious_ids]
@@ -173,49 +200,62 @@ def run_poisoning_experiment(
         if config.attack_type == "sf":
             for cid in malicious_selected:
                 participation_counts[cid] += 1
-                # Step 1: honest training
                 honest_update = clients[cid].train(global_sd)
-                # Step 2: sign-flip
-                updates[cid] = sign_flip_attack(honest_update, u=config.sf_scale_u)
+                poisoned_update = sign_flip_attack(honest_update, u=config.sf_scale_u)
+                updates[cid] = poisoned_update
+
+                # SF norm ratio logging
+                honest_norm = torch.norm(
+                    torch.cat([v.flatten().float() for v in honest_update.values()])
+                ).item()
+                poisoned_norm = torch.norm(
+                    torch.cat([v.flatten().float() for v in poisoned_update.values()])
+                ).item()
+                sf_debug_log.append({
+                    "round": round_t,
+                    "client_id": cid,
+                    "honest_norm": honest_norm,
+                    "poisoned_norm": poisoned_norm,
+                    "norm_ratio": poisoned_norm / max(honest_norm, 1e-12),
+                    "scale_u": config.sf_scale_u,
+                })
 
         elif config.attack_type == "alie":
-            # Collect malicious clients' clean updates (needed for "original" mode)
+            # Collect malicious clients' clean updates
             malicious_clean = {}
             for cid in malicious_selected:
                 participation_counts[cid] += 1
                 malicious_clean[cid] = clients[cid].train(global_sd)
 
-            # Build benign-only updates dict
             benign_updates = {c: updates[c] for c in benign_selected}
 
-            # Craft single ALIE vector
             n_part = len(selected)
             n_mal = len(malicious_selected)
             if n_mal > 0 and (len(benign_updates) > 0 or len(malicious_clean) > 0):
-                p_mal = alie_attack(
+                p_mal, alie_debug = alie_attack(
                     benign_updates=benign_updates,
                     malicious_clean_updates=malicious_clean,
                     n_participants=n_part,
                     n_malicious=n_mal,
                     mode=config.alie_mode,
+                    clip_prob_eps=config.alie_clip_prob_eps,
                 )
-                # All malicious clients submit the same crafted update
+                alie_debug["round"] = round_t
+                alie_debug_log.append(alie_debug)
+
                 for cid in malicious_selected:
                     updates[cid] = p_mal
             else:
-                # No malicious selected this round; nothing to do
-                pass
+                pass  # No malicious selected this round
 
         elif config.attack_type == "lf":
             for cid in malicious_selected:
                 participation_counts[cid] += 1
-                # Train on label-flipped dataset
                 updates[cid] = clients[cid].train_with_dataset(
                     global_sd, lf_datasets[cid]
                 )
 
         elif config.attack_type == "none":
-            # No malicious clients
             pass
 
         else:
@@ -254,13 +294,22 @@ def run_poisoning_experiment(
         # ── LF-specific metrics ──────────────────────────────────────────
         if config.attack_type == "lf":
             eval_model.load_state_dict(server.get_global_state_dict())
-            asr, tacc = evaluate_targeted_attack(
+            asr, tacc, source_total = evaluate_targeted_attack(
                 eval_model, test_loader,
                 config.lf_source_class, config.lf_target_class,
                 config.device,
             )
             asr_list.append(asr)
             tacc_list.append(tacc)
+
+            lf_round_log.append({
+                "round": round_t,
+                "source_class": config.lf_source_class,
+                "target_class": config.lf_target_class,
+                "source_test_count": source_total,
+                "ASR": asr,
+                "TACC": tacc,
+            })
 
         logger.info(
             f"Round {round_t:>2d}: acc={test_acc:.4f}  loss={test_loss:.4f}  "
@@ -313,7 +362,6 @@ def run_poisoning_experiment(
         vals = [float(np.mean(store[c])) if store[c] else 0.0 for c in ids]
         return float(np.mean(vals)) if vals else 0.0
 
-    # Final per-class SV metrics (cumulative across all rounds)
     def _final_per_class_var(ids):
         vals = [float(np.var(cumulative_per_class_sv[c])) for c in ids]
         return float(np.mean(vals)) if vals else 0.0
@@ -356,6 +404,7 @@ def run_poisoning_experiment(
         sv_vec = cumulative_per_class_sv[cid]
         per_client_final.append({
             "experiment_name": config.experiment_name,
+            "attack_name": config.attack_type,
             "client_id": cid,
             "is_malicious": cid in malicious_ids,
             "cumulative_sv": cumulative_sv[cid],
@@ -364,8 +413,16 @@ def run_poisoning_experiment(
             "participation_count": participation_counts[cid],
         })
 
+    debug_info = {
+        "alie_rounds": alie_debug_log,
+        "lf_rounds": lf_round_log,
+        "sf_rounds": sf_debug_log,
+        "lf_client_stats": lf_client_stats,
+    }
+
     return (round_details, summary, test_accs, test_losses,
-            asr_list, tacc_list, per_client_final, cumulative_per_class_sv)
+            asr_list, tacc_list, per_client_final, cumulative_per_class_sv,
+            debug_info)
 
 
 # ─── plotting ────────────────────────────────────────────────────────────────
@@ -379,10 +436,13 @@ def generate_poisoning_plots(
     malicious_ids: set,
     attack_names: list,
     num_classes: int = 20,
+    all_debug: dict = None,         # exp_name -> debug_info dict
 ):
     """Generate all poisoning experiment visualizations."""
     os.makedirs(results_dir, exist_ok=True)
     df = pd.DataFrame(round_details)
+    if all_debug is None:
+        all_debug = {}
 
     cmap_h = "steelblue"
     cmap_m = "coral"
@@ -488,7 +548,6 @@ def generate_poisoning_plots(
         ax.set_xlabel("Client ID"); ax.set_ylabel("Cumulative SV")
         ax.set_title(f"{label}: Per-Client Cumulative Shapley Value")
         ax.axhline(y=0, color="k", lw=0.5); ax.grid(True, axis="y")
-        # Legend
         from matplotlib.patches import Patch
         ax.legend(handles=[Patch(color=cmap_h, label="Honest"),
                            Patch(color=cmap_m, label="Malicious")])
@@ -515,7 +574,6 @@ def generate_poisoning_plots(
         label = exp_name.replace("attack_", "").upper()
         ax.set_title(f"{label}: Per-Client Per-Round Shapley Value")
         plt.colorbar(im, ax=ax, label="Round SV")
-        # Mark malicious clients
         for idx, cid in enumerate(pivot.index):
             if cid in malicious_ids:
                 ax.text(-1.5, idx, "★", fontsize=10, color="red",
@@ -564,7 +622,7 @@ def generate_poisoning_plots(
         pcf = pd.DataFrame(per_client_data[exp_name])
         label = exp_name.replace("attack_", "").upper()
 
-        # 4a. Box/violin plots of final per-class SV variance
+        # 4a. Box plots of final per-class SV variance
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
         h_var = pcf[~pcf["is_malicious"]]["final_per_class_sv_variance"]
         m_var = pcf[pcf["is_malicious"]]["final_per_class_sv_variance"]
@@ -651,31 +709,60 @@ def generate_poisoning_plots(
         plt.close(fig)
 
     # ═══════════════════════════════════════════════════════════════════════
+    # 6. ALIE diagnostic plots
+    # ═══════════════════════════════════════════════════════════════════════
+    for exp_name, dbg in all_debug.items():
+        alie_rounds = dbg.get("alie_rounds", [])
+        if not alie_rounds:
+            continue
+
+        adf = pd.DataFrame(alie_rounds)
+        label = exp_name.replace("attack_", "").upper()
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        # 6a. z_max vs round
+        axes[0].plot(adf["round"], adf["z_max"], marker="o", markersize=4)
+        axes[0].axhline(y=0, color="k", lw=0.5)
+        axes[0].axhline(y=0.1, color="orange", lw=0.8, ls="--", label="weak threshold (0.1)")
+        axes[0].set_xlabel("Round"); axes[0].set_ylabel("z_max")
+        axes[0].set_title(f"{label}: z_max per Round")
+        axes[0].legend(); axes[0].grid(True)
+
+        # 6b. ||p_mal - mu|| vs round
+        axes[1].plot(adf["round"], adf["diff_from_mu_norm"], marker="o",
+                     markersize=4, color="red")
+        axes[1].set_xlabel("Round"); axes[1].set_ylabel("||p_mal - mu||")
+        axes[1].set_title(f"{label}: Distance from Mean Update")
+        axes[1].grid(True)
+
+        # 6c. cosine(p_mal, mu) vs round
+        axes[2].plot(adf["round"], adf["cosine_pmal_mu"], marker="o",
+                     markersize=4, color="purple")
+        axes[2].axhline(y=1.0, color="k", lw=0.5, ls="--")
+        axes[2].set_xlabel("Round"); axes[2].set_ylabel("cosine(p_mal, mu)")
+        axes[2].set_title(f"{label}: Cosine Similarity to Mean")
+        axes[2].set_ylim([-1.05, 1.05])
+        axes[2].grid(True)
+
+        fig.tight_layout()
+        fig.savefig(os.path.join(results_dir, f"{exp_name}_alie_diagnostics.png"),
+                    dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        logger.info(f"ALIE diagnostic plots saved for {exp_name}")
+
+    # ═══════════════════════════════════════════════════════════════════════
     # Bonus: per-class per-round SV heatmap for representative clients
     # ═══════════════════════════════════════════════════════════════════════
-    # (one honest, one malicious per attack)
     for exp_name in attack_names:
         sub = df[df["experiment_name"] == exp_name]
         if sub.empty:
             continue
-
-        # Pick representative honest and malicious client
         honest_cids = sorted([c for c in sub["client_id"].unique() if c not in malicious_ids])
         mal_cids = sorted([c for c in sub["client_id"].unique() if c in malicious_ids])
         if not honest_cids or not mal_cids:
             continue
-
-        rep_h = honest_cids[0]
-        rep_m = mal_cids[0]
-
-        # Get per-class SV data from round_details
-        sub_h = sub[sub["client_id"] == rep_h].sort_values("round")
-        sub_m = sub[sub["client_id"] == rep_m].sort_values("round")
-
-        # We only have aggregate class metrics in round_details, not per-class vectors.
-        # For the heatmap, we'll use the cumulative per-class SV (final snapshot).
-        # This gives a single fingerprint per client, not per-round per-class.
-        # Skip this if data isn't rich enough.
 
     logger.info(f"All plots saved to {results_dir}/")
 
@@ -687,10 +774,13 @@ def export_poisoning_results(
     summaries: list,
     per_client_all: list,
     output_dir: str,
+    all_debug: dict = None,
 ) -> str:
-    """Export poisoning experiment results to Excel."""
+    """Export poisoning experiment results to Excel with debug sheets."""
     os.makedirs(output_dir, exist_ok=True)
     filepath = os.path.join(output_dir, "poisoning_results.xlsx")
+    if all_debug is None:
+        all_debug = {}
 
     df_details = pd.DataFrame(round_details)
     df_summary = pd.DataFrame(summaries)
@@ -700,6 +790,30 @@ def export_poisoning_results(
         df_details.to_excel(writer, sheet_name="round_details", index=False)
         df_summary.to_excel(writer, sheet_name="experiment_summary", index=False)
         df_clients.to_excel(writer, sheet_name="per_client_final", index=False)
+
+        # ALIE per-round debug table
+        for exp_name, dbg in all_debug.items():
+            alie_rounds = dbg.get("alie_rounds", [])
+            if alie_rounds:
+                adf = pd.DataFrame(alie_rounds)
+                sheet_name = f"alie_debug_{exp_name}"[:31]  # Excel 31-char limit
+                adf.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        # LF per-round targeted-attack table
+        for exp_name, dbg in all_debug.items():
+            lf_rounds = dbg.get("lf_rounds", [])
+            if lf_rounds:
+                ldf = pd.DataFrame(lf_rounds)
+                sheet_name = f"lf_rounds_{exp_name}"[:31]
+                ldf.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        # SF per-round debug table
+        for exp_name, dbg in all_debug.items():
+            sf_rounds = dbg.get("sf_rounds", [])
+            if sf_rounds:
+                sdf = pd.DataFrame(sf_rounds)
+                sheet_name = f"sf_debug_{exp_name}"[:31]
+                sdf.to_excel(writer, sheet_name=sheet_name, index=False)
 
     return filepath
 
@@ -729,6 +843,8 @@ def main():
         # Poisoning defaults
         sf_scale_u=-1.0,
         alie_mode="svrfl",
+        alie_clip_prob_eps=1e-6,
+        alie_debug_log=True,
         lf_source_class=0,             # alt.atheism
         lf_target_class=10,            # sci.crypt
     )
@@ -757,6 +873,7 @@ def main():
     all_per_client: dict = {}           # exp_name -> list of per_client dicts
     all_cumul_pc_sv: dict = {}          # exp_name -> {cid: ndarray}
     all_per_client_flat: list[dict] = []
+    all_debug: dict = {}                # exp_name -> debug_info
 
     for exp_name, attack_type in experiments:
         cfg = copy.deepcopy(base)
@@ -765,7 +882,7 @@ def main():
 
         (details, summary, accs, losses,
          asr_list, tacc_list, per_client_final,
-         cumul_pc_sv) = run_poisoning_experiment(
+         cumul_pc_sv, debug_info) = run_poisoning_experiment(
             cfg, train_ds, val_ds, test_ds, input_dim, train_labels,
         )
 
@@ -778,6 +895,7 @@ def main():
         all_per_client[exp_name] = per_client_final
         all_cumul_pc_sv[exp_name] = cumul_pc_sv
         all_per_client_flat.extend(per_client_final)
+        all_debug[exp_name] = debug_info
 
     # ── mark attack effectiveness (relative to baseline) ─────────────────
     baseline_acc = all_summaries[0]["final_global_accuracy"]
@@ -794,7 +912,8 @@ def main():
     # ── export ───────────────────────────────────────────────────────────
     os.makedirs(base.results_dir, exist_ok=True)
     filepath = export_poisoning_results(
-        all_details, all_summaries, all_per_client_flat, base.results_dir,
+        all_details, all_summaries, all_per_client_flat,
+        base.results_dir, all_debug,
     )
     logger.info(f"Excel results exported to {filepath}")
 
@@ -806,6 +925,7 @@ def main():
         malicious_ids,
         attack_names + ["baseline_no_attack"],
         num_classes=base.num_classes,
+        all_debug=all_debug,
     )
 
     # ── print summary table ──────────────────────────────────────────────
@@ -828,6 +948,25 @@ def main():
             line += f"  ASR={s['final_asr']:.4f}  TACC={s['final_tacc']:.4f}"
         print(line)
     print("=" * 120)
+
+    # ── ALIE diagnostic summary ──────────────────────────────────────────
+    for exp_name, dbg in all_debug.items():
+        alie_rounds = dbg.get("alie_rounds", [])
+        if not alie_rounds:
+            continue
+        print(f"\n{'='*80}")
+        print(f"ALIE DIAGNOSTICS: {exp_name}")
+        print(f"{'='*80}")
+        adf = pd.DataFrame(alie_rounds)
+        print(f"  z_max:  mean={adf['z_max'].mean():.4f}, "
+              f"min={adf['z_max'].min():.4f}, max={adf['z_max'].max():.4f}")
+        print(f"  ||p_mal-mu||:  mean={adf['diff_from_mu_norm'].mean():.4f}, "
+              f"min={adf['diff_from_mu_norm'].min():.4f}, max={adf['diff_from_mu_norm'].max():.4f}")
+        print(f"  cos(p_mal,mu): mean={adf['cosine_pmal_mu'].mean():.6f}, "
+              f"min={adf['cosine_pmal_mu'].min():.6f}, max={adf['cosine_pmal_mu'].max():.6f}")
+        weak_rounds = (adf["z_max"].abs() < 0.1).sum()
+        print(f"  Rounds with |z_max|<0.1 (weak): {weak_rounds}/{len(adf)}")
+        print(f"{'='*80}")
 
     # ── detection analysis ───────────────────────────────────────────────
     print("\n" + "=" * 120)
@@ -852,11 +991,9 @@ def main():
         round_sv_detect = "YES" if abs(sv_h - sv_m) / max(abs(sv_h), 1e-9) > 0.3 else "WEAK/NO"
         cum_sv_detect = "YES" if abs(cum_h - cum_m) / max(abs(cum_h), 1e-9) > 0.3 else "WEAK/NO"
 
-        # For variance: higher variance for malicious = detectable
         var_ratio = fvar_m / max(fvar_h, 1e-12)
         var_detect = "YES" if var_ratio > 2.0 or var_ratio < 0.5 else "WEAK/NO"
 
-        # For positive sum: lower positive sum for malicious = detectable
         pos_ratio = fpos_m / max(fpos_h, 1e-9) if fpos_h > 0 else 0.0
         pos_detect = "YES" if pos_ratio < 0.5 or pos_ratio > 2.0 else "WEAK/NO"
 

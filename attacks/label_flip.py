@@ -84,9 +84,10 @@ def create_label_flipped_subset(
     y_sub = y_full[indices].clone()
 
     mask = y_sub == source_class
+    n_source = int(mask.sum().item())
     y_sub[mask] = target_class
 
-    return TensorDataset(X_sub, y_sub)
+    return TensorDataset(X_sub, y_sub), n_source
 
 
 @torch.no_grad()
@@ -100,6 +101,7 @@ def evaluate_targeted_attack(model, test_loader, source_class: int,
     asr : Attack Success Rate — fraction of source-class samples
         predicted as target class.
     tacc : accuracy on source-class samples (lower = attack more effective).
+    source_total : number of source-class test samples (the denominator).
     """
     model.eval()
     source_total = 0
@@ -117,8 +119,8 @@ def evaluate_targeted_attack(model, test_loader, source_class: int,
             source_predicted_target += (preds[source_mask] == target_class).sum().item()
 
     if source_total == 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0
 
     asr = source_predicted_target / source_total
     tacc = source_correct / source_total
-    return asr, tacc
+    return asr, tacc, source_total

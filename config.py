@@ -50,6 +50,8 @@ class Config:
     # mode: "svrfl" (default) — mu/sigma from benign updates
     #        "original"        — mu/sigma from malicious clean updates
     alie_mode: str = "svrfl"
+    alie_clip_prob_eps: float = 1e-6   # clipping eps for p in z_max
+    alie_debug_log: bool = True        # emit per-round ALIE diagnostics
 
     # Label-Flipping (LF): source_class → target_class relabeling
     # For 20 Newsgroups: source=0 (alt.atheism) → target=10 (sci.crypt)
