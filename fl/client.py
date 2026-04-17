@@ -23,6 +23,23 @@ class FLClient:
         Local training starting from global model.
         Returns the model update delta = local_params - global_params.
         """
+        return self._do_train(global_state_dict, self.data_loader)
+
+    def train_with_dataset(self, global_state_dict: OrderedDict,
+                           dataset) -> OrderedDict:
+        """
+        Local training on an alternative dataset (e.g., label-flipped).
+        Returns the model update delta = local_params - global_params.
+        """
+        loader = DataLoader(
+            dataset, batch_size=self.config.batch_size,
+            shuffle=True, drop_last=False,
+        )
+        return self._do_train(global_state_dict, loader)
+
+    def _do_train(self, global_state_dict: OrderedDict,
+                  data_loader) -> OrderedDict:
+        """Core local training loop."""
         model = self.model_fn()
         model.load_state_dict(copy.deepcopy(global_state_dict))
         model.to(self.config.device)
@@ -37,7 +54,7 @@ class FLClient:
         criterion = nn.CrossEntropyLoss()
 
         for _ in range(self.config.local_epochs):
-            for X, y in self.data_loader:
+            for X, y in data_loader:
                 X, y = X.to(self.config.device), y.to(self.config.device)
                 optimizer.zero_grad()
                 loss = criterion(model(X), y)

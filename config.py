@@ -23,7 +23,7 @@ class Config:
     participation_ratio: float = 0.8
     batch_size: int = 64
 
-    # Attack: "none", "dfr", "sdfr", "afr"
+    # Attack: "none", "dfr", "sdfr", "afr", "sf", "alie", "lf"
     attack_type: str = "none"
     malicious_ratio: float = 0.4
 
@@ -41,6 +41,20 @@ class Config:
     afr_e_cos_beta_override: float | None = None
     afr_noisy_frac: float = 0.1         # fraction of params to perturb (d/D)
     afr_base_norm_ema_alpha: float = 0.3 # EMA smoothing for |E[U_f(θ)]|
+
+    # ── Poisoning attack parameters ──────────────────────────────────────
+    # Sign-Flipping (SF): g_poisoned = u * g_honest, u must be negative
+    sf_scale_u: float = -1.0            # default u = -1; optional u = -4
+
+    # ALIE: coordinate-wise p_mal_j = mu_j - z_max * sigma_j
+    # mode: "svrfl" (default) — mu/sigma from benign updates
+    #        "original"        — mu/sigma from malicious clean updates
+    alie_mode: str = "svrfl"
+
+    # Label-Flipping (LF): source_class → target_class relabeling
+    # For 20 Newsgroups: source=0 (alt.atheism) → target=10 (sci.crypt)
+    lf_source_class: int = 0
+    lf_target_class: int = 10
 
     # Shapley
     num_mc_samples: int = 30
