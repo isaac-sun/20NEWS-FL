@@ -398,7 +398,7 @@ def main():
         val_ratio=0.1,
         iid=True,
         malicious_ratio=0.4,
-        num_mc_samples=30,
+        num_mc_samples=15,
         seed=42,
         results_dir="results",
         # device is auto-detected via Config default_factory
