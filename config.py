@@ -33,8 +33,8 @@ class Config:
     lora_dropout: float = 0.05
 
     # Federated Learning
-    num_rounds: int = 30
-    local_epochs: int = 2
+    num_rounds: int = 50
+    local_epochs: int = 4
     local_lr: float = 0.0005           # typical LoRA lr range: 1e-4 to 5e-4
     server_lr: float = 0.3             # scaled for batch_size=32 (16× more steps/round)
     participation_ratio: float = 0.8

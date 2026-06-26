@@ -453,13 +453,12 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
 
 
 # ─── main ────────────────────────────────────────────────────────────────────
-
 def main():
     base = Config(
         model_dir=os.environ.get("MODEL_DIR", ""),
+        num_rounds=50,
+        local_epochs=4,
         num_clients=10,
-        num_rounds=30,
-        local_epochs=2,
         local_lr=0.0005,
         server_lr=0.3,
         participation_ratio=0.8,
