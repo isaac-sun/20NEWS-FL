@@ -198,7 +198,7 @@ Key hyperparameters in `config.py`:
 | Parameter | Default | Description |
 |---|---|---|
 | `num_clients` | 10 | Total FL clients |
-| `num_rounds` | 50 | FL communication rounds |
+| `num_rounds` | 30 | FL communication rounds |
 | `local_epochs` | 2 | Local training epochs per round |
 | `lora_r` | 32 | LoRA rank |
 | `lora_alpha` | 32.0 | LoRA scaling factor |

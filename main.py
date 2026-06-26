@@ -388,7 +388,7 @@ def main():
 
     base = Config(
         num_clients=10,
-        num_rounds=50,
+        num_rounds=30,
         local_epochs=2,
         local_lr=0.0005,
         server_lr=0.5,
