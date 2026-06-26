@@ -262,12 +262,15 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
 
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
     eval_model = model_fn()
-    # torch.compile speeds up repeated Shapley inference significantly
-    if config.device == "cuda":
-        try:
-            eval_model = torch.compile(eval_model, mode="reduce-overhead")
-        except Exception:
-            pass  # older PyTorch — silent fallback
+    # NOTE: torch.compile with reduce-overhead caches parameters at graph
+    # capture time, causing load_lora_state_dict changes to be invisible —
+    # all Shapley values compute to zero.  Disabled until a compile-safe
+    # approach is available; overhead is ~15-20 % slower Shapley estimation.
+    # if config.device == "cuda":
+    #     try:
+    #         eval_model = torch.compile(eval_model, mode="reduce-overhead")
+    #     except Exception:
+    #         pass
     class_weights = _class_weights_from_loader(val_loader, config.num_classes)
 
     # ── FL rounds ────────────────────────────────────────────────────────
