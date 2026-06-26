@@ -260,7 +260,7 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
     dfr_sigma_est = None
     afr_state = AFRState(ema_alpha=config.afr_base_norm_ema_alpha) if config.attack_type == "afr" else None
 
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
+    val_loader = DataLoader(val_dataset, batch_size=config.eval_batch_size)
     eval_model = model_fn()
     # NOTE: torch.compile with reduce-overhead caches parameters at graph
     # capture time, causing load_lora_state_dict changes to be invisible —

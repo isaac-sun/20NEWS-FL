@@ -40,6 +40,9 @@ class Config:
     participation_ratio: float = 0.8
     batch_size: int = 32               # ~32 batches/epoch/client → 512 steps/round
 
+    # ── Shapley evaluation ─────────────────────────────────────────────
+    eval_batch_size: int = 256           # large batch for MC Shapley inference
+
     # ── Local training optimizations ────────────────────────────────────
     label_smoothing: float = 0.1
     weight_decay: float = 0.01
