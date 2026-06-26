@@ -13,7 +13,9 @@ class FLClient:
         self.client_id = client_id
         self.dataset = dataset
         self.config = config
-        self.model_fn = model_fn
+        # ── 模型常驻显存，避免每轮从磁盘重复加载 ──────────────────────
+        self.model = model_fn()
+        self.model.to(config.device)
         self.data_loader = DataLoader(
             dataset, batch_size=config.batch_size, shuffle=True, drop_last=False,
             num_workers=8, pin_memory=True,
@@ -49,10 +51,9 @@ class FLClient:
           - Gradient clipping → prevents instability
           - Weight decay → mild L2 regularization on LoRA params
         """
-        model = self.model_fn()
+        model = self.model  # 复用常驻显存的模型
         from models.lora_classifier import load_lora_state_dict
         load_lora_state_dict(model, global_state_dict)
-        model.to(self.config.device)
         model.train()
 
         trainable_params = [p for p in model.parameters() if p.requires_grad]
