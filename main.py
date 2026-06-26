@@ -369,6 +369,13 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
 # ─── main ────────────────────────────────────────────────────────────────────
 
 def main():
+    # ── GPU 最大化利用 ────────────────────────────────────────────────
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True            # 自动选最优算法
+        torch.set_float32_matmul_precision('high')        # TF32 加速 (Ampere+)
+        logger.info("GPU optimizations enabled: cudnn.benchmark + TF32")
+    # ───────────────────────────────────────────────────────────────────
+
     base = Config(
         num_clients=10,
         num_rounds=50,
@@ -376,7 +383,7 @@ def main():
         local_lr=0.0005,
         server_lr=0.5,
         participation_ratio=0.8,
-        batch_size=32,
+        batch_size=128,
         num_classes=20,
         val_ratio=0.1,
         iid=True,

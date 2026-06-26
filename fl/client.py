@@ -15,7 +15,8 @@ class FLClient:
         self.config = config
         self.model_fn = model_fn
         self.data_loader = DataLoader(
-            dataset, batch_size=config.batch_size, shuffle=True, drop_last=False
+            dataset, batch_size=config.batch_size, shuffle=True, drop_last=False,
+            num_workers=4, pin_memory=True,
         )
 
     def train(self, global_state_dict: OrderedDict) -> OrderedDict:
@@ -34,6 +35,7 @@ class FLClient:
         loader = DataLoader(
             dataset, batch_size=self.config.batch_size,
             shuffle=True, drop_last=False,
+            num_workers=4, pin_memory=True,
         )
         return self._do_train(global_state_dict, loader)
 
@@ -78,9 +80,11 @@ class FLClient:
                 for pg in optimizer.param_groups:
                     pg["lr"] = lr
 
-                input_ids, attn_mask, y = [b.to(self.config.device) for b in batch]
+                input_ids, attn_mask, y = [b.to(self.config.device, non_blocking=True)
+                                            for b in batch]
                 optimizer.zero_grad()
-                loss = criterion(model(input_ids, attention_mask=attn_mask), y)
+                with torch.cuda.amp.autocast():
+                    loss = criterion(model(input_ids, attention_mask=attn_mask), y)
                 loss.backward()
 
                 # ── Gradient clipping ────────────────────────────────────
