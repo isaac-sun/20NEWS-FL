@@ -30,6 +30,12 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+# ── 抑制 HuggingFace transformers 模型加载时的 LOAD REPORT 刷屏 ──────
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+import logging as _logging
+_logging.getLogger("transformers").setLevel(_logging.ERROR)
+_logging.getLogger("transformers.modeling_utils").setLevel(_logging.ERROR)
+
 from config import Config
 from utils.seed import set_seed
 from utils.logger import get_logger
