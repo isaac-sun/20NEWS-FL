@@ -3,79 +3,119 @@
 Federated Learning on 20 Newsgroups — DistilBERT + LoRA
 Free-Rider Attacks + Per-Class Shapley Detection.
 
+Works on: Colab / school GPU platform / local machine.
+Auto-detects environment and applies appropriate optimizations.
+
 Runs four experiments:
   1. baseline (no attack)
   2. DFR  (Disguised Free-Rider)
   3. SDFR (Scaled Delta Free-Rider)
   4. AFR  (Advanced Free-Rider)
-
-Outputs:
-  results/experiment_results.xlsx
-  results/plots/fig_01 … fig_10 (10 chart groups)
 """
 
 import os
 import sys
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Bootstrap — 一站式处理云平台的各种限制
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 最早诊断：确认 Python 已启动，stdout 可用
-# ═══════════════════════════════════════════════════════════════════════════════
-sys.stdout.write("[20NEWS-FL] Python bootstrap starting...\n")
-sys.stdout.flush()
+# 0. Bootstrap — earliest possible diagnostics, works everywhere
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# 0. 强制实时输出 — 兼容云平台/Notebook 等非标准 stdout
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, 'reconfigure'):
+def _stamp(msg: str):
+    """Write directly to stdout/stderr — survives broken loggers, containers, notebooks."""
+    for stream in (sys.stdout, sys.stderr):
         try:
-            _stream.reconfigure(write_through=True)
-        except (OSError, ValueError):
-            pass  # 某些环境（如 Jupyter/Databricks）reconfigure 不可用
+            stream.write(f"[20NEWS-FL] {msg}\n")
+            stream.flush()
+        except Exception:
+            pass
 
-_project_dir = os.path.dirname(os.path.abspath(__file__))
+_stamp("Python bootstrap starting")
+_stamp(f"  Python {sys.version.split()[0]}  |  cwd: {os.getcwd()}")
 
-# 1. sklearn 数据集写到项目目录（解决 /scikit_learn_data 没写权限）
-_sklearn_data = os.path.join(_project_dir, "sklearn_data")
-if "SCIKIT_LEARN_DATA" not in os.environ:
-    os.environ["SCIKIT_LEARN_DATA"] = _sklearn_data
-    os.makedirs(_sklearn_data, exist_ok=True)
+# ── Force unbuffered output (containers / cloud platforms) ───────────────
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, 'reconfigure'):
+        try:
+            _s.reconfigure(write_through=True)
+        except (OSError, ValueError, AttributeError):
+            pass
 
-# 2. HuggingFace 模型走本地缓存（解决无网络/无写权限）
-_model_cache = os.path.join(_project_dir, "model_cache")
-if os.path.isdir(_model_cache) and "MODEL_DIR" not in os.environ:
-    os.environ["MODEL_DIR"] = _model_cache
+# ── Project paths ────────────────────────────────────────────────────────
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+_stamp(f"  Project dir: {_PROJECT_DIR}")
 
-# 3. HuggingFace 镜像（本地缓存命中时不会访问网络）
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+# sklearn data cache (writable dir for platforms with restricted /home)
+_SKLEARN_DATA = os.path.join(_PROJECT_DIR, "sklearn_data")
+os.environ.setdefault("SCIKIT_LEARN_DATA", _SKLEARN_DATA)
+os.makedirs(_SKLEARN_DATA, exist_ok=True)
 
-# 4. PyTorch 线程限制
+# HuggingFace model cache (local-first, offline-capable)
+_MODEL_CACHE = os.path.join(_PROJECT_DIR, "model_cache")
+if os.path.isdir(_MODEL_CACHE):
+    os.environ.setdefault("MODEL_DIR", _MODEL_CACHE)
+    _stamp(f"  model_cache found: {_MODEL_CACHE}")
+else:
+    _stamp("  model_cache not found (will download from HuggingFace)")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. Environment tuning — safe defaults, no side effects
+# ═══════════════════════════════════════════════════════════════════════════════
+
 os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-# 4b. 抑制 HuggingFace 模型加载刷屏日志
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
+# Suppress HuggingFace model-loading log spam
 import logging as _logging
-_logging.getLogger("transformers").setLevel(_logging.ERROR)
-_logging.getLogger("transformers.modeling_utils").setLevel(_logging.ERROR)
-
-# 5. 本地 pip 包目录（run.sh 负责安装到这里）
-_pip_pkgs = os.path.join(_project_dir, "pip_pkgs")
-if _pip_pkgs not in sys.path and os.path.isdir(_pip_pkgs):
-    sys.path.insert(0, _pip_pkgs)
+for _name in ("transformers", "transformers.modeling_utils", "safetensors", "filelock"):
+    _logging.getLogger(_name).setLevel(_logging.ERROR)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 正式 imports
+# 2. Device detection — safe, FORCE_DEVICE=cpu skips CUDA entirely
 # ═══════════════════════════════════════════════════════════════════════════════
+
+_FORCE = os.environ.get("FORCE_DEVICE", "").lower()
+_stamp(f"  FORCE_DEVICE={'auto' if not _FORCE else _FORCE}")
+
+_stamp("Importing torch...")
+import torch
+_stamp(f"  torch {torch.__version__} imported")
+
+def _detect_device() -> str:
+    if _FORCE in ("cpu",):
+        return "cpu"
+    if _FORCE in ("cuda", "gpu"):
+        return "cuda"
+    try:
+        if torch.cuda.is_available():
+            _stamp(f"  CUDA: {torch.cuda.get_device_name(0)}")
+            return "cuda"
+    except Exception as e:
+        _stamp(f"  CUDA detection failed: {e}")
+    if torch.backends.mps.is_available():
+        _stamp("  MPS available")
+        return "mps"
+    return "cpu"
+
+_DEVICE = _detect_device()
+_stamp(f"  Device: {_DEVICE}")
+
+# ── GPU optimizations ────────────────────────────────────────────────────
+if _DEVICE == "cuda":
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision('high')       # TF32 on Ampere+
+    torch.cuda.amp.autocast.__default_dtype__ = torch.bfloat16
+    _stamp("  GPU opts: cudnn.benchmark + TF32 + bf16 autocast")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. Project imports
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_stamp("Importing project modules...")
 
 import copy
-
 import numpy as np
-import pandas as pd
-import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
@@ -83,11 +123,7 @@ from config import Config
 from utils.seed import set_seed
 from utils.logger import get_logger
 from data.newsgroups import load_newsgroups
-from models.lora_classifier import (
-    DistilBERTWithLoRA,
-    get_lora_state_dict,
-    load_lora_state_dict,
-)
+from models.lora_classifier import DistilBERTWithLoRA
 from fl.client import FLClient
 from fl.server import FLServer
 from fl.aggregation import fedavg_aggregate
@@ -103,6 +139,8 @@ from contribution.shapley import (
 from detection.utility_score import UtilityScoreTracker
 from utils.partition import iid_partition, non_iid_partition
 from utils.export import export_results
+
+_stamp("All imports OK")
 
 logger = get_logger()
 
@@ -134,12 +172,10 @@ def _apply_attack(attack_type, global_sd, global_history, config,
                             round_num=round_num, gamma=config.dfr_gamma,
                             trainable_keys=trainable_keys)
         return update, {}
-
     elif attack_type == "sdfr":
         update = sdfr_attack(global_sd, global_history,
                               trainable_keys=trainable_keys)
         return update, {}
-
     elif attack_type == "afr":
         e_cos_beta = 0.0
         if config.afr_e_cos_beta_override is not None:
@@ -158,7 +194,6 @@ def _apply_attack(attack_type, global_sd, global_history, config,
             trainable_keys=trainable_keys,
         )
         return update, {"afr_base_norm": base_norm}
-
     raise ValueError(f"Unknown attack type: {attack_type}")
 
 
@@ -183,9 +218,6 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
         cid: Subset(train_dataset, indices)
         for cid, indices in partition.items()
     }
-
-    # Per-client sample counts for Shapley coalition weighting
-    # (friend's standard: w_S = Σ n_j·w_j / Σ n_j)
     client_sample_counts = {
         cid: len(indices) for cid, indices in partition.items()
     }
@@ -225,16 +257,22 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
     }
 
     # ── attack state trackers ───────────────────────────────────────────
-    dfr_sigma_est = None          # estimated sigma for DFR
+    dfr_sigma_est = None
     afr_state = AFRState(ema_alpha=config.afr_base_norm_ema_alpha) if config.attack_type == "afr" else None
 
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
     eval_model = model_fn()
+    # torch.compile speeds up repeated Shapley inference significantly
+    if config.device == "cuda":
+        try:
+            eval_model = torch.compile(eval_model, mode="reduce-overhead")
+        except Exception:
+            pass  # older PyTorch — silent fallback
     class_weights = _class_weights_from_loader(val_loader, config.num_classes)
 
     # ── FL rounds ────────────────────────────────────────────────────────
     for round_t in tqdm(range(config.num_rounds), desc=config.experiment_name):
-        # ── Round-level cosine LR decay (global curriculum) ────────────
+        # Round-level cosine LR decay (global curriculum)
         config.local_lr = config.get_round_local_lr(round_t)
 
         selected = server.select_clients(
@@ -284,7 +322,6 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
             afr_state.update(val_loss_t, avg_base_norm)
 
         # ── per-class Shapley estimation ─────────────────────────────────
-        # Build sample_counts dict for only the selected clients this round
         round_sample_counts = {cid: client_sample_counts[cid] for cid in selected}
         per_class_sv = estimate_round_shapley_per_class(
             eval_model, updates, global_sd, val_loader,
@@ -294,7 +331,6 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
             sample_counts=round_sample_counts,
         )
 
-        # derive overall Shapley and per-class metrics
         shapley_vals = per_class_to_overall(per_class_sv, class_weights)
         class_metrics = compute_class_metrics(per_class_sv)
 
@@ -413,52 +449,36 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
             per_class_records, cumulative_per_class_sv)
 
 
-
-
 # ─── main ────────────────────────────────────────────────────────────────────
-
-
-def _cloud_stamp(msg: str):
-    """Write directly to stdout with immediate flush — survives broken loggers."""
-    try:
-        sys.stdout.write(msg + "\n")
-        sys.stdout.flush()
-    except Exception:
-        pass
 
 def main():
     base = Config(
         model_dir=os.environ.get("MODEL_DIR", ""),
         num_clients=10,
-        num_rounds=50,
+        num_rounds=30,
         local_epochs=2,
         local_lr=0.0005,
-        server_lr=0.5,
+        server_lr=0.3,
         participation_ratio=0.8,
         batch_size=32,
         num_classes=20,
         val_ratio=0.1,
         iid=True,
         malicious_ratio=0.4,
-        num_mc_samples=30,
+        num_mc_samples=15,
         seed=42,
         results_dir="results",
-        # device is auto-detected via Config default_factory
     )
+    base.device = _DEVICE  # use the safely-detected device
+    _stamp(f"Config OK — device: {base.device}")
 
-    # ── 云平台诊断：打印关键信息，定位卡死位置 ──────────────────────────
-    _cloud_stamp("[20NEWS-FL] Entering main()")
-    _cloud_stamp(f"  Python: {sys.version.split()[0]}  |  Device: {base.device}")
-    _cloud_stamp(f"  model_cache: {os.path.isdir(os.path.join(os.path.dirname(__file__), 'model_cache'))}")
-    _cloud_stamp(f"  sklearn_data: {os.path.isdir(os.path.join(os.path.dirname(__file__), 'sklearn_data'))}")
-    _cloud_stamp(f"  MODEL_DIR env: {os.environ.get('MODEL_DIR', '(not set)')}")
-    _cloud_stamp(f"  SCIKIT_LEARN_DATA env: {os.environ.get('SCIKIT_LEARN_DATA', '(not set)')}")
     logger.info(f"Using device: {base.device}")
     if base.device == "cuda":
         logger.info(f"GPU: {torch.cuda.get_device_name(0)} | "
                     f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
     # ── load data once ───────────────────────────────────────────────────
+    _stamp("Loading 20 Newsgroups data...")
     set_seed(base.seed)
     train_ds, val_ds, test_ds, input_dim, train_labels = load_newsgroups(
         model_name=base.model_name,
@@ -466,13 +486,12 @@ def main():
         max_seq_length=base.max_seq_length,
         model_dir=base.model_dir,
     )
-    _cloud_stamp(f"Data loaded — train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}")
+    _stamp(f"Data loaded — train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}")
     logger.info(
-        f"Data loaded — input_dim={input_dim}, "
-        f"train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}"
+        f"Data loaded — train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}"
     )
 
-    _cloud_stamp("[20NEWS-FL] Starting experiments: baseline, DFR, SDFR, AFR")
+    _stamp("Starting experiments: baseline, DFR, SDFR, AFR")
 
     # ── run experiments ──────────────────────────────────────────────────
     experiments = [
@@ -492,7 +511,9 @@ def main():
         cfg = copy.deepcopy(base)
         cfg.experiment_name = exp_name
         cfg.attack_type = attack_type
+        cfg.device = _DEVICE
 
+        _stamp(f"  Running: {exp_name}")
         (details, summary, accs, losses,
          pc_records, cum_pc_sv) = run_experiment(
             cfg, train_ds, val_ds, test_ds, input_dim, train_labels
@@ -503,6 +524,7 @@ def main():
         all_curves[exp_name] = {"acc": accs, "loss": losses}
         all_pc_records.extend(pc_records)
         all_cum_pc_sv[exp_name] = cum_pc_sv
+        _stamp(f"  Done: {exp_name} — final acc={summary['final_global_accuracy']:.4f}")
 
     # ── mark attack effectiveness (relative to baseline) ─────────────────
     baseline_acc = all_summaries[0]["final_global_accuracy"]
@@ -516,6 +538,7 @@ def main():
     filepath = export_results(all_details, all_summaries, base.results_dir,
                               per_class_records=all_pc_records)
     logger.info(f"Excel results exported to {filepath}")
+    _stamp(f"Excel exported: {filepath}")
 
     # ── plots ────────────────────────────────────────────────────────────
     from visualization.plots import generate_plots
@@ -527,6 +550,7 @@ def main():
     generate_plots(all_curves, all_details, all_pc_records, all_cum_pc_sv,
                    base.experiment_name, class_names, plots_dir)
     logger.info(f"Plots saved to {plots_dir}/")
+    _stamp(f"Plots saved: {plots_dir}/")
 
     # ── print summary table ──────────────────────────────────────────────
     print("\n" + "=" * 100)
@@ -545,6 +569,8 @@ def main():
             f"PosSum_m={s.get('avg_positive_class_sv_sum_malicious',0):.6f}"
         )
     print("=" * 100)
+
+    _stamp("All experiments complete")
 
 
 if __name__ == "__main__":

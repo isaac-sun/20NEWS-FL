@@ -23,58 +23,56 @@ class Config:
     num_clients: int = 10
     iid: bool = True
     val_ratio: float = 0.1
-    max_seq_length: int = 512             # ↑ 256→512: 91% docs fully covered (vs 76%)
+    max_seq_length: int = 512             # 91% docs fully covered (vs 76% at 256)
 
     # Model
     model_name: str = "distilbert-base-uncased"
     num_classes: int = 20
-    lora_r: int = 32                   # ↑ 8→32: more capacity for 20-class task
-    lora_alpha: float = 32.0           # ↑ 16→32: scale proportionally with r
+    lora_r: int = 32
+    lora_alpha: float = 32.0
+    lora_dropout: float = 0.05
 
     # Federated Learning
-    num_rounds: int = 50               # ↑ 30→50: more FL rounds for convergence
-    local_epochs: int = 2              # ↑ 1→2: better local learning per round
+    num_rounds: int = 30
+    local_epochs: int = 2
     local_lr: float = 0.0005           # typical LoRA lr range: 1e-4 to 5e-4
-    server_lr: float = 0.3             # ↓ 0.5→0.3: more steps → larger aggregate deltas
+    server_lr: float = 0.3             # scaled for batch_size=32 (16× more steps/round)
     participation_ratio: float = 0.8
-    batch_size: int = 32               # DistilBERT fits comfortably on L20 (48GB)
+    batch_size: int = 32               # ~32 batches/epoch/client → 512 steps/round
 
-    # ── Local training optimizations (zero extra FWD/BWD cost) ──────────
-    label_smoothing: float = 0.1       # soften one-hot targets → better generalization
-    weight_decay: float = 0.01         # L2 regularization on LoRA params
-    max_grad_norm: float = 1.0         # gradient clipping for stability
-    warmup_ratio: float = 0.1          # linear warmup fraction of total local steps
-    lora_dropout: float = 0.05         # dropout on LoRA outputs (standard in PEFT)
+    # ── Local training optimizations ────────────────────────────────────
+    label_smoothing: float = 0.1
+    weight_decay: float = 0.01
+    max_grad_norm: float = 1.0
+    warmup_ratio: float = 0.1
 
-    # ── Round-level cosine LR decay (global curriculum) ─────────────────
+    # ── Round-level cosine LR decay ─────────────────────────────────────
     local_lr_schedule: str = "cosine"  # "cosine" or "constant"
-    local_lr_min: float = 5e-5         # floor for cosine decay (10× below initial)
+    local_lr_min: float = 5e-5         # floor for cosine decay
 
-    # ── Server-side optimizations (zero extra FWD/BWD cost) ─────────────
-    server_momentum: float = 0.7       # ↓ 0.9→0.7: fewer artifacts with more steps/round
-    server_lr_decay: float = 0.98      # per-round exponential decay of server_lr
+    # ── Server-side optimizations ───────────────────────────────────────
+    server_momentum: float = 0.7
+    server_lr_decay: float = 0.98      # per-round exponential decay
 
     # Attack: "none", "dfr", "sdfr", "afr"
     attack_type: str = "none"
     malicious_ratio: float = 0.4
 
-    # DFR: g = sigma * t^{-gamma} * N(0,I)  — [11] Fraboni et al.
-    dfr_sigma: float = 0.5              # fallback; auto-estimated when possible
+    # DFR: g = sigma * t^{-gamma} * N(0,I)  — Fraboni et al.
+    dfr_sigma: float = 0.5
     dfr_gamma: float = 1.0
-    dfr_estimate_sigma: bool = True     # estimate σ from initial global delta
+    dfr_estimate_sigma: bool = True
 
-    # SDFR: U_f = ||delta_t||/||delta_prev|| * delta_t  — [12] Zhu et al.
+    # SDFR: U_f = ||delta_t||/||delta_prev|| * delta_t  — Zhu et al.
     # No manual parameters; derived from consecutive global deltas.
 
-    # AFR: SDFR + calibrated sparse noise  — [12] Zhu et al.
-    # E[cos β] is estimated dynamically from validation loss trajectory.
-    # Override below is used ONLY when dynamic estimation is unavailable.
+    # AFR: SDFR + calibrated sparse noise  — Zhu et al.
     afr_e_cos_beta_override: float | None = None
-    afr_noisy_frac: float = 0.1         # fraction of params to perturb (d/D)
-    afr_base_norm_ema_alpha: float = 0.3 # EMA smoothing for |E[U_f(θ)]|
+    afr_noisy_frac: float = 0.1
+    afr_base_norm_ema_alpha: float = 0.3
 
     # Shapley
-    num_mc_samples: int = 30
+    num_mc_samples: int = 15
 
     # Utility
     utility_alpha: float = 0.5
@@ -86,12 +84,7 @@ class Config:
     experiment_name: str = "default"
 
     def get_round_local_lr(self, round_num: int) -> float:
-        """Compute local_lr for a given FL round via cosine schedule.
-
-        Cosine annealing from local_lr → local_lr_min over num_rounds.
-        Centralized training uses this per-step; FL uses it per-round
-        (global curriculum — each round starts from a lower LR).
-        """
+        """Cosine annealing from local_lr → local_lr_min over num_rounds."""
         if self.local_lr_schedule == "constant":
             return self.local_lr
         if self.num_rounds <= 1:
