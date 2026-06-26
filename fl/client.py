@@ -83,7 +83,7 @@ class FLClient:
                 input_ids, attn_mask, y = [b.to(self.config.device, non_blocking=True)
                                             for b in batch]
                 optimizer.zero_grad()
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                     loss = criterion(model(input_ids, attention_mask=attn_mask), y)
                 loss.backward()
 
