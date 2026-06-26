@@ -16,7 +16,7 @@ class FLClient:
         self.model_fn = model_fn
         self.data_loader = DataLoader(
             dataset, batch_size=config.batch_size, shuffle=True, drop_last=False,
-            num_workers=4, pin_memory=True,
+            num_workers=8, pin_memory=True,
         )
 
     def train(self, global_state_dict: OrderedDict) -> OrderedDict:
@@ -35,7 +35,7 @@ class FLClient:
         loader = DataLoader(
             dataset, batch_size=self.config.batch_size,
             shuffle=True, drop_last=False,
-            num_workers=4, pin_memory=True,
+            num_workers=8, pin_memory=True,
         )
         return self._do_train(global_state_dict, loader)
 

@@ -188,6 +188,12 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
 
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
     eval_model = model_fn()
+    # torch.compile 在 A100 上对重复推理（Shapley 240 次/轮）提效显著
+    if config.device == "cuda":
+        try:
+            eval_model = torch.compile(eval_model, mode="reduce-overhead")
+        except Exception:
+            pass  # 旧版 PyTorch 可能不支持，静默降级
     class_weights = _class_weights_from_loader(val_loader, config.num_classes)
 
     # ── FL rounds ────────────────────────────────────────────────────────
@@ -369,12 +375,14 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
 # ─── main ────────────────────────────────────────────────────────────────────
 
 def main():
-    # ── GPU 最大化利用 ────────────────────────────────────────────────
+    # ── A100 最大化利用 ──────────────────────────────────────────────
     if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True            # 自动选最优算法
-        torch.set_float32_matmul_precision('high')        # TF32 加速 (Ampere+)
-        logger.info("GPU optimizations enabled: cudnn.benchmark + TF32")
-    # ───────────────────────────────────────────────────────────────────
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision('high')     # TF32
+        # A100 优先用 bf16（同 fp32 动态范围，比 fp16 稳）
+        torch.cuda.amp.autocast.__default_dtype__ = torch.bfloat16
+        logger.info("A100 optimizations: cudnn.benchmark + TF32 + bf16 autocast")
+    # ─────────────────────────────────────────────────────────────────
 
     base = Config(
         num_clients=10,
@@ -383,7 +391,7 @@ def main():
         local_lr=0.0005,
         server_lr=0.5,
         participation_ratio=0.8,
-        batch_size=128,
+        batch_size=512,
         num_classes=20,
         val_ratio=0.1,
         iid=True,
