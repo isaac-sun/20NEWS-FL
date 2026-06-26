@@ -36,6 +36,13 @@ import logging as _logging
 _logging.getLogger("transformers").setLevel(_logging.ERROR)
 _logging.getLogger("transformers.modeling_utils").setLevel(_logging.ERROR)
 
+# ── HuggingFace token（从环境变量读取，不写死在代码里）────────────────
+# Colab 用户：在 Secrets 里设置 HF_TOKEN，代码自动读取
+if os.environ.get("HF_TOKEN"):
+    from huggingface_hub import login
+    login(token=os.environ["HF_TOKEN"])
+    _logging.getLogger("transformers").info("HF_TOKEN loaded from environment")
+
 from config import Config
 from utils.seed import set_seed
 from utils.logger import get_logger
