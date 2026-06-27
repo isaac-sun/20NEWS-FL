@@ -28,8 +28,8 @@ class Config:
     # Model
     model_name: str = "distilbert-base-uncased"
     num_classes: int = 20
-    lora_r: int = 32
-    lora_alpha: float = 32.0
+    lora_r: int = 64                   # ↑ 32→64: more capacity for 20-class task
+    lora_alpha: float = 64.0           # scale proportionally with r
     lora_dropout: float = 0.05
 
     # Federated Learning
