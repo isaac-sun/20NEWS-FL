@@ -460,7 +460,7 @@ def main():
         local_epochs=4,
         num_clients=10,
         local_lr=0.0005,
-        server_lr=1.0,
+        server_lr=0.5,
         participation_ratio=0.8,
         batch_size=32,
         num_classes=20,

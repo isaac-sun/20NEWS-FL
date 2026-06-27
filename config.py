@@ -36,7 +36,7 @@ class Config:
     num_rounds: int = 50
     local_epochs: int = 4
     local_lr: float = 0.0005           # typical LoRA lr range: 1e-4 to 5e-4
-    server_lr: float = 1.0             # standard FedAvg (full client update avg)
+    server_lr: float = 0.5             # balanced for local_epochs=4 (128 steps/client)
     participation_ratio: float = 0.8
     batch_size: int = 32               # ~32 batches/epoch/client → 512 steps/round
 
