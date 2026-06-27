@@ -457,10 +457,10 @@ def main():
     base = Config(
         model_dir=os.environ.get("MODEL_DIR", ""),
         num_rounds=50,
-        local_epochs=4,
+        local_epochs=2,
         num_clients=10,
         local_lr=0.0005,
-        server_lr=0.5,
+        server_lr=0.7,
         participation_ratio=0.8,
         batch_size=32,
         num_classes=20,
