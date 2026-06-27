@@ -36,7 +36,7 @@ class Config:
     num_rounds: int = 50
     local_epochs: int = 4
     local_lr: float = 0.0005           # typical LoRA lr range: 1e-4 to 5e-4
-    server_lr: float = 0.3             # scaled for batch_size=32 (16× more steps/round)
+    server_lr: float = 1.0             # standard FedAvg (full client update avg)
     participation_ratio: float = 0.8
     batch_size: int = 32               # ~32 batches/epoch/client → 512 steps/round
 
@@ -50,12 +50,12 @@ class Config:
     warmup_ratio: float = 0.1
 
     # ── Round-level cosine LR decay ─────────────────────────────────────
-    local_lr_schedule: str = "cosine"  # "cosine" or "constant"
+    local_lr_schedule: str = "constant" # LoRA doesn't need LR decay
     local_lr_min: float = 5e-5         # floor for cosine decay
 
     # ── Server-side optimizations ───────────────────────────────────────
-    server_momentum: float = 0.7
-    server_lr_decay: float = 0.98      # per-round exponential decay
+    server_momentum: float = 0.9
+    server_lr_decay: float = 1.0        # no server LR decay needed
 
     # Attack: "none", "dfr", "sdfr", "afr"
     attack_type: str = "none"
