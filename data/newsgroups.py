@@ -1,7 +1,7 @@
 """
 20 Newsgroups data loading with DistilBERT tokenization.
 
-Returns tokenized TensorDatasets for use with DistilBERTWithLoRA.
+Returns tokenized TensorDatasets for full DistilBERT fine-tuning.
 Each sample is (input_ids, attention_mask, label).
 
 Works on: Colab / school GPU platform / local machine.
@@ -40,7 +40,7 @@ def load_newsgroups(
     max_samples: int | None = None,
     model_dir: str = "",
 ):
-    """Load 20 Newsgroups with tokenized inputs for DistilBERT + LoRA.
+    """Load 20 Newsgroups with tokenized inputs for DistilBERT.
 
     Returns: (train_ds, val_ds, test_ds, input_dim=None, train_labels)
     """

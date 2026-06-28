@@ -49,9 +49,7 @@ def _build_coalition_params(
     Friend's formula:
         w_S = Σ_{j∈S} n_j · w_j  /  Σ_{j∈S} n_j
 
-    With LoRA: only trainable (LoRA + head) parameters are communicated.
-    Frozen DistilBERT backbone is copied from global_state_dict unchanged.
-    The formula applies only to the trainable parameter subset.
+    All full-model parameters are communicated in this experiment.
 
     Parameters
     ----------
@@ -67,19 +65,20 @@ def _build_coalition_params(
     if total_n == 0:
         total_n = 1
 
-    # Iterate over trainable keys only (from any client's update)
-    ref_keys = list(updates[next(iter(coalition))].keys())
     new_state = OrderedDict()
 
-    for key in ref_keys:
+    for key, global_value in global_state_dict.items():
         # Weighted sum of deltas: Σ n_j · delta_j
-        agg = torch.zeros_like(updates[coalition[0]][key], dtype=torch.float64)
+        agg = torch.zeros_like(global_value)
         for cid in coalition:
             n_j = sample_counts.get(cid, 1)
-            agg = agg + n_j * updates[cid][key].to(dtype=torch.float64)
+            agg.add_(updates[cid][key].to(
+                device=global_value.device, dtype=global_value.dtype
+            ), alpha=n_j)
         # w_S = w_g + Σ n_j·delta_j / Σ n_j
-        new_state[key] = (global_state_dict[key].to(dtype=torch.float64)
-                          + agg / total_n).to(dtype=global_state_dict[key].dtype)
+        new_state[key] = global_value + agg / total_n
+        if not torch.isfinite(new_state[key]).all():
+            raise FloatingPointError(f"non-finite coalition parameter: {key}")
     return new_state
 
 
@@ -89,7 +88,7 @@ def _evaluate_per_class_loss(
 ) -> np.ndarray:
     """Evaluate per-class average cross-entropy loss.
 
-    Loads a partial (trainable-only) state dict into the model.
+    Loads a full state dict into the model.
     Handles both 3-tuple (input_ids, attention_mask, labels) and
     2-tuple (features, labels) data loader formats.
 
@@ -110,6 +109,8 @@ def _evaluate_per_class_loss(
         else:
             X, y = batch[0].to(device), batch[1].to(device)
             per_sample_loss = criterion(model(X), y)
+        if not torch.isfinite(per_sample_loss).all():
+            raise FloatingPointError("non-finite loss during Shapley evaluation")
         for c in range(num_classes):
             mask = y == c
             if mask.any():

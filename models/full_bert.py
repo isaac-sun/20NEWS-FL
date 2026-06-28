@@ -1,7 +1,7 @@
 """
 Full DistilBERT classifier for federated learning.
 
-All parameters are trainable — no LoRA, no frozen layers.
+All parameters are trainable; no layers are frozen.
 The full model (~66M params) is communicated in every FL round.
 """
 
@@ -22,9 +22,11 @@ class FullDistilBERTClassifier(nn.Module):
         model_name: str = "distilbert-base-uncased",
         num_classes: int = 20,
         dropout: float = 0.3,
+        model_dir: str = "",
     ):
         super().__init__()
-        self.bert = AutoModel.from_pretrained(model_name)
+        model_kwargs = {"cache_dir": model_dir} if model_dir else {}
+        self.bert = AutoModel.from_pretrained(model_name, **model_kwargs)
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(self.bert.config.dim, num_classes)
         self.num_classes = num_classes
@@ -46,5 +48,8 @@ class FullDistilBERTClassifier(nn.Module):
         self.load_state_dict(sd, strict=True)
 
 
-def get_tokenizer(model_name: str = "distilbert-base-uncased") -> AutoTokenizer:
-    return AutoTokenizer.from_pretrained(model_name)
+def get_tokenizer(
+    model_name: str = "distilbert-base-uncased", model_dir: str = ""
+) -> AutoTokenizer:
+    tokenizer_kwargs = {"cache_dir": model_dir} if model_dir else {}
+    return AutoTokenizer.from_pretrained(model_name, **tokenizer_kwargs)

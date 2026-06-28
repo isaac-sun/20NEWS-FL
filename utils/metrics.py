@@ -9,6 +9,7 @@ def evaluate_model(model, data_loader, device="cpu"):
     Supports both 3-tuple (input_ids, attention_mask, labels) for DistilBERT
     and 2-tuple (features, labels) for MLP classifiers.
     """
+    model.to(device)
     model.eval()
     criterion = nn.CrossEntropyLoss()
     total_loss = 0.0
@@ -24,7 +25,11 @@ def evaluate_model(model, data_loader, device="cpu"):
             # Embedding: (X, y)
             X, y = batch[0].to(device), batch[1].to(device)
             outputs = model(X)
+        if not torch.isfinite(outputs).all():
+            raise FloatingPointError("model evaluation produced non-finite logits")
         loss = criterion(outputs, y)
+        if not torch.isfinite(loss):
+            raise FloatingPointError("model evaluation produced a non-finite loss")
         total_loss += loss.item() * y.size(0)
         _, predicted = outputs.max(1)
         correct += predicted.eq(y).sum().item()

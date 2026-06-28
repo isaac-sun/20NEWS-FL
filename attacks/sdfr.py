@@ -1,37 +1,27 @@
-import math
-
-import torch
 from collections import OrderedDict
 from typing import List
+
+import math
+import torch
 
 
 def sdfr_attack(
     global_state_dict: OrderedDict,
     global_history: List[OrderedDict],
     eps: float = 1e-10,
-    trainable_keys: list = None,
 ) -> OrderedDict:
     """
-    Scaled Delta Free-Rider (SDFR) — Zhu et al. [12], SVRFL Sec. 4.
+    Scaled-delta free-rider attack, Zhu et al. Eq. (9).
 
-    Generates updates only for trainable (LoRA + head) parameters.
+        U_f(theta) = ||theta(t)-theta(t-1)|| / ||theta(t-1)-theta(t-2)||
+                     * (theta(t)-theta(t-1))
+
+    The paper's construction requires three consecutive global states.
+    Callers must use honest warm-up rounds before invoking this function.
     """
-    keys = trainable_keys if trainable_keys is not None else list(global_state_dict.keys())
-    k = len(global_history)
-    update = OrderedDict()
+    if len(global_history) < 2:
+        raise ValueError("SDFR requires theta(t), theta(t-1), and theta(t-2)")
 
-    if k == 0:
-        for key in keys:
-            update[key] = torch.randn_like(global_state_dict[key]) * 1e-4
-        return update
-
-    if k == 1:
-        w_prev = global_history[-1]
-        for key in keys:
-            update[key] = global_state_dict[key] - w_prev[key]
-        return update
-
-    # Full paper formula (k ≥ 2)
     w_t = global_state_dict
     w_t1 = global_history[-1]
     w_t2 = global_history[-2]
@@ -39,15 +29,24 @@ def sdfr_attack(
     delta_t_norm_sq = 0.0
     delta_prev_norm_sq = 0.0
     delta_t = OrderedDict()
+    update = OrderedDict()
 
-    for key in keys:
+    for key in w_t:
         dt = w_t[key].float() - w_t1[key].float()
         dp = w_t1[key].float() - w_t2[key].float()
         delta_t[key] = w_t[key] - w_t1[key]
         delta_t_norm_sq += dt.pow(2).sum().item()
         delta_prev_norm_sq += dp.pow(2).sum().item()
 
-    scale = math.sqrt(delta_t_norm_sq) / (math.sqrt(delta_prev_norm_sq) + eps)
+    current_norm = math.sqrt(delta_t_norm_sq)
+    previous_norm = math.sqrt(delta_prev_norm_sq)
+    if previous_norm <= eps:
+        raise FloatingPointError(
+            "SDFR denominator is zero; two preceding global states are identical"
+        )
+    scale = current_norm / previous_norm
+    if not math.isfinite(scale):
+        raise FloatingPointError(f"non-finite SDFR scale: {scale}")
 
     for key in delta_t:
         update[key] = delta_t[key] * scale

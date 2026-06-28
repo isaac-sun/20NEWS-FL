@@ -10,13 +10,7 @@ from utils.metrics import evaluate_model
 
 
 class FLServer:
-    """Federated learning server managing global model and evaluation.
-
-    With LoRA, global_state_dict stores only trainable parameters.
-    The frozen DistilBERT backbone is loaded once in the model and never changes.
-
-    Supports server-side momentum and learning rate decay for better convergence.
-    """
+    """Federated learning server managing the full global model."""
 
     def __init__(self, model, val_dataset, test_dataset, config):
         self.model = model
@@ -24,12 +18,14 @@ class FLServer:
         self.global_state_dict = model.get_state_dict()
         # Sliding window of up to 3 previous global state dicts
         self.global_history: deque = deque(maxlen=3)
-        # Server momentum buffer (only used when config.server_momentum > 0)
-        self.momentum_buffer: OrderedDict | None = None
-        # Track current server_lr (starts from config.server_lr, decays each round)
-        self.current_server_lr: float = config.server_lr
-        self.val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
-        self.test_loader = DataLoader(test_dataset, batch_size=config.batch_size)
+        eval_loader_kwargs = {"batch_size": config.eval_batch_size}
+        if config.device == "cuda":
+            eval_loader_kwargs.update(
+                num_workers=config.num_workers,
+                pin_memory=True,
+            )
+        self.val_loader = DataLoader(val_dataset, **eval_loader_kwargs)
+        self.test_loader = DataLoader(test_dataset, **eval_loader_kwargs)
 
     def select_clients(self, num_clients: int, participation_ratio: float) -> list:
         """Randomly select a subset of clients for this round."""
@@ -45,10 +41,7 @@ class FLServer:
         )
 
     def update_global_model(self, new_state_dict: OrderedDict):
-        """Update trainable params with new aggregated values.
-
-        Applies server_lr exponential decay after this update.
-        """
+        """Update all global parameters and retain the preceding states."""
         # Push current state into history before overwriting
         self.global_history.append(
             OrderedDict({k: v.clone() for k, v in self.global_state_dict.items()})
@@ -57,11 +50,6 @@ class FLServer:
             {k: v.clone() for k, v in new_state_dict.items()}
         )
         self.model.load_state_dict_from(self.global_state_dict)
-
-        # ── Apply server learning rate decay ────────────────────────────
-        if self.config.server_lr_decay < 1.0:
-            self.current_server_lr *= self.config.server_lr_decay
-            self.current_server_lr = max(self.current_server_lr, 0.01)
 
     def evaluate(self):
         """Evaluate global model on test set. Returns (loss, accuracy)."""

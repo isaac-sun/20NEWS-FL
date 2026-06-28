@@ -1,165 +1,121 @@
-# 20 Newsgroups Federated Learning — Free-Rider Attack & Shapley Detection
+# 实验配置与攻击对齐说明
 
-## 环境准备
+## 当前执行配置
+
+### 数据与模型
+
+| 项目 | 配置 |
+|---|---|
+| 数据集 | 20 Newsgroups |
+| 预处理 | 移除 headers、footers、quotes |
+| 划分 | 训练集的 10% 作为分层验证集 |
+| 客户端 | 10，IID |
+| 模型 | `distilbert-base-uncased`，全参数训练 |
+| 分类头 | Dropout(0.3) + Linear(768, 20) |
+| 最大序列长度 | 512 |
+
+### 联邦训练
+
+| 参数 | 值 |
+|---|---:|
+| 通信轮数 | 50 |
+| 每轮参与率 | 1.0 |
+| 本地 epoch | 2 |
+| 本地学习率 | 2e-5 |
+| batch size | 8 |
+| 优化器 | AdamW |
+| weight decay | 0.01 |
+| label smoothing | 0.1 |
+| warmup ratio | 0.1 |
+| 梯度裁剪 | 1.0 |
+| 聚合 | 按客户端样本量加权的标准 FedAvg |
+| 服务端动量/学习率 | 无 |
+
+### 攻击与 Shapley
+
+| 参数 | 值 |
+|---|---:|
+| 恶意客户端比例 | 0.4（客户端 0–3） |
+| SDFR/AFR honest warm-up | 2 轮 |
+| DFR gamma | 1.0 |
+| DFR sigma | 由首次全局模型增量自动拟合 |
+| AFR C | 由 honest warm-up 更新按 Lemma 1/2 自动估计 |
+| AFR 噪声参数比例 | 0.1 |
+| Monte Carlo permutations | 15 |
+| Shapley eval batch size | 按 GPU profile 自动选择 16 / 32 / 64 |
+| seed | 42 |
+
+### NVIDIA GPU profile
+
+训练 batch 始终为 8，保证不同 GPU 上的训练语义一致。`--gpu-profile auto`
+只根据显存调整 Shapley 推理 batch 和 DataLoader workers：
+
+| 显存 | profile | eval batch | workers |
+|---:|---|---:|---:|
+| ≤16GB | t4 | 16 | 2 |
+| 16–40GB | medium | 32 | 4 |
+| >40GB | large | 64 | 4 |
+
+推荐指令：
 
 ```bash
-cd /Users/isaac/Codes/Researches/20NEWS-FL
-pip install -r requirements.txt
+FORCE_DEVICE=cuda python -u main.py --require-cuda --gpu-profile auto
 ```
 
-依赖：`torch`, `scikit-learn`, `numpy`, `pandas`, `matplotlib`, `openpyxl`, `tqdm`, `transformers`
+`--require-cuda` 会在 CUDA 不可用时立即停止，防止完整实验意外在 CPU 上运行。
+`--results-dir PATH` 可修改结果目录。最终解析后的 GPU 名称、显存、profile、
+batch 和 workers 会写入 Excel 的 `experiment_config` sheet。
 
----
+## 攻击公式
 
-## 实验入口
+### DFR
 
-| 脚本 | 攻击类型 | 说明 |
-|------|---------|------|
-| `main.py` | DFR / SDFR / AFR | 搭便车攻击（Free-Rider） |
+依据 Fraboni 等人的 disguised free-rider：
 
-每次运行 **4 组实验**（1 个 baseline + 3 个攻击），结果输出到 `results/`。
-
----
-
-## 快速开始
-
-```bash
-python main.py
+```text
+delta_f(t) = sigma * t^(-gamma) * epsilon_t
+epsilon_t ~ N(0, I)
 ```
 
-> **首次运行** 会自动下载：
-> - 20 Newsgroups 数据集（~20MB）
-> - bert-base-uncased 模型（~440MB）
-> - 然后用 frozen BERT 预计算全部文本的 768 维 embedding（约 1-3 分钟）
+`sigma` 使用第一次可观测的 `theta(1)-theta(0)` 所有坐标的总体标准差。
+在该增量尚不可观测的第 1 轮，客户端返回 plain free-rider 的零更新，避免使用
+与论文无关的固定大噪声。
 
-如果本地已有缓存，后续运行直接读取，不再重新下载。
+### SDFR
 
----
+依据 Zhu 等人 Eq. (9)：
 
-## 配置参数说明
-
-所有参数集中在 `config.py` → `Config` dataclass：
-
-### 数据
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `num_clients` | 10 | 客户端总数 |
-| `iid` | True | True=IID 划分, False=Non-IID |
-| `val_ratio` | 0.1 | 验证集占训练集比例 |
-| `bert_model_name` | `bert-base-uncased` | HuggingFace 模型名 |
-
-### 模型
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `hidden_dim` | 256 | 分类头隐藏层维度 |
-| `num_classes` | 20 | 20 Newsgroups 类别数 |
-
-### 联邦学习
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `num_rounds` | 30 | 通信轮数 |
-| `local_epochs` | 3 | 客户端本地训练轮数 |
-| `local_lr` | 0.001 | 本地学习率 (Adam) |
-| `server_lr` | 1.0 | 服务端聚合步长 |
-| `participation_ratio` | 0.8 | 每轮参与客户端比例 |
-| `batch_size` | 64 | 训练/评估 batch size |
-
-### 攻击
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `attack_type` | `"none"` | `"none"`, `"dfr"`, `"sdfr"`, `"afr"` |
-| `malicious_ratio` | 0.4 | 恶意客户端比例 |
-| `dfr_sigma` | 0.5 | DFR 噪声初始标准差 |
-| `dfr_gamma` | 1.0 | DFR 噪声衰减指数 |
-| `afr_noisy_frac` | 0.1 | AFR 噪声扰动参数比例 |
-
-### Shapley
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `num_mc_samples` | 30 | Monte Carlo permutation 次数 |
-| `utility_alpha` | 0.5 | Utility score EMA 系数 |
-
----
-
-## 输出结果
-
-### 控制台输出
-
-每个实验结束后打印汇总表格：
-
-```
-==============================================================================================================
-EXPERIMENT SUMMARY
-==============================================================================================================
-  baseline_no_attack      0.6893  1.0948  +0.008892  +0.000000  1.29e-03  0.00e+00  0.380465  0.000000
-  attack_dfr              0.6693  1.1684  +0.040620  -0.040508  2.98e-03  2.21e-02  0.959273  0.074677
-  ...
+```text
+U_f(theta) = ||theta(t)-theta(t-1)|| / ||theta(t-1)-theta(t-2)||
+             * (theta(t)-theta(t-1))
 ```
 
-列含义：`Acc` `Loss` `SV_h`(honest mean SV) `SV_m`(malicious mean SV) `Var_h` `Var_m` `PosSum_h` `PosSum_m`
+### AFR
 
-### Excel 文件
+依据 Zhu 等人 Lemma 1、Lemma 2 和 Algorithm 1：
 
-`results/experiment_results.xlsx` 包含三个 sheet：
-- **round_shapley_details**：每轮每个客户端的详细 SV 和聚合指标
-- **experiment_summary**：实验汇总
-- **per_class_records**：每轮每个客户端的 20 类 raw Shapley 值
+```text
+E[cos beta] = C^2 / (C^2 + exp(2 * lambda_bar * t))
 
-### 图表
+|phi(t)| = sqrt(n^2 / (n + (n^2-n)E[cos beta]) - 1) * |U_f(theta)|
 
-所有图表输出到 `results/plots/`，使用 seaborn 专业风格 + 300dpi：
+U_hat_f(theta) = U_f(theta) + phi(t) * N(0, 1/d)
+```
 
-| 图片 | 内容 |
-|------|------|
-| `fig_01_accuracy_loss.png` | 全局 acc + loss 曲线，含 baseline 对比 |
-| `fig_02_shapley_round_cumulative.png` | 左：round SV 折线；右：cumulative SV 柱状 |
-| `fig_03_shapley_heatmap.png` | 每客户端每轮 SV 热力图（4 实验），恶意行红框 |
-| `fig_04_per_class_fingerprint.png` | 每类 SV 指纹（honest 有峰 vs free-rider 平坦） |
-| `fig_05_two_metric_scatter.png` | Variance vs Positive Sum 散点图（后 5 轮均值） |
-| `fig_06_metric_boxplots.png` | 上排方差箱线，下排正和箱线 |
-| `fig_07_per_class_sv_deepdive.png` | DFR 深度：单诚实 vs 单恶意 class×round 热力图 |
-| `fig_08_class_metrics_overview.png` | 方差/正和随轮次折线 + 最终均值柱状 |
-| `fig_09_cumulative_sv_bar.png` | 每实验各客户端累积 SV 柱状（颜色区分诚实/恶意） |
-| `fig_10_multi_attack_summary.png` | 多攻击并排：方差和正和的诚实 vs 恶意对比 |
+噪声只施加到比例为 `d/D` 的随机参数坐标。`lambda_bar` 根据全局模型增量
+`l(t)=||theta(t)-theta(t-1)||` 的衰减估计。论文 Algorithm 1 排版中的比值会得到
+负衰减率，与其 Lemma 1 和 `exp(-lambda*t)` 推导矛盾；实现采用与推导一致的
+`-log(l(t)/l(1))/(t-1)`。
 
----
+## 数值安全
 
-## Shapley 值计算说明
+- 客户端上传和全局状态统一存储在 CPU，避免 CUDA/MPS 设备混用。
+- 每个客户端更新、聚合状态、模型 logits、loss 和 Shapley coalition 都检查有限值。
+- 任意 NaN/Inf 会立即终止实验，不再导出看似成功的结果。
+- Excel 包含实际运行配置，结果可以追溯。
 
-本项目的 Shapley 值采用 **Monte Carlo permutation sampling**：
+## 论文来源
 
-1. **Value function**（对类别 c）：
-   ```
-   v_c(S) = Loss(w_g, D_v^c) - Loss(w_S, D_v^c)
-   ```
-   含义：coalition S 相比全局模型让类别 c 的验证 loss 降低了多少。
-
-2. **Coalition 模型**（对齐朋友标准）：
-   ```
-   w_S = Σ_{j∈S} n_j · w_j  /  Σ_{j∈S} n_j
-   ```
-   即按客户端样本数加权平均的本地模型参数，不使用 `server_lr`。
-
-3. **边际贡献**：
-   ```
-   Δloss_i,c = previous_loss_c - current_loss_c
-   ```
-   客户端 i 加入 coalition 后，loss 降低越多 → SV 越大。
-
-4. **Shapley 估计**：
-   ```
-   SV_i,c ≈ (1/M) Σ_m [ v_c(P_i^m ∪ {i}) - v_c(P_i^m) ]
-   ```
-   M = `num_mc_samples`（默认 30 次随机排列）
-
-5. **摘要指标**（per client）：
-   - `class_sv_variance`：20 个类别 SV 的方差（honest 高 → 贡献有类别特异性）
-   - `positive_class_sv_sum`：正 SV 之和（honest 高 → 有真实正向贡献）
-
----
-
-## 模型架构
-
-- **Frozen BERT** (bert-base-uncased)：预计算 768 维 sentence embedding（不参与训练）
-- **Classifier head**：`Linear(768, hidden) → ReLU → Dropout → Linear(hidden, 20)`
-- 总参数量：~202K（仅 classifier head 参与 FL 训练）
+- Jin, Hu, Min, *Robust and Fair Federated Learning Based on Model-Agnostic Shapley Value*, IEEE Transactions on Networking, DOI: 10.1109/TON.2025.3630314.
+- Fraboni, Vidal, Lorenzi, *Free-rider Attacks on Model Aggregation in Federated Learning*, AISTATS 2021.
+- Zhu et al., *Advanced Free-rider Attacks in Federated Learning*, NeurIPS NFFL Workshop 2021.

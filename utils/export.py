@@ -9,8 +9,9 @@ def export_results(
     experiment_summaries: list,
     output_dir: str = "results",
     per_class_records: list | None = None,
+    experiment_config: dict | None = None,
 ) -> str:
-    """Export experiment results to an Excel file with up to three sheets."""
+    """Export results and the exact executable configuration to Excel."""
     os.makedirs(output_dir, exist_ok=True)
     filepath = os.path.join(output_dir, "experiment_results.xlsx")
 
@@ -28,6 +29,14 @@ def export_results(
             df_pc = pd.DataFrame(per_class_records)
             df_pc.to_excel(
                 writer, sheet_name="per_class_records", index=False
+            )
+        if experiment_config:
+            df_config = pd.DataFrame(
+                [{"parameter": key, "value": value}
+                 for key, value in experiment_config.items()]
+            )
+            df_config.to_excel(
+                writer, sheet_name="experiment_config", index=False
             )
 
     return filepath

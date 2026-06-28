@@ -1,4 +1,5 @@
 from collections import OrderedDict
+import gc
 
 import torch
 import torch.nn as nn
@@ -6,7 +7,7 @@ from torch.utils.data import DataLoader
 
 
 class FLClient:
-    """Federated learning client with local LoRA training."""
+    """Federated learning client with full-model local training."""
 
     def __init__(self, client_id: int, dataset, model_fn, config):
         self.client_id = client_id
@@ -19,7 +20,10 @@ class FLClient:
             batch_size=config.batch_size, shuffle=True, drop_last=False,
         )
         if config.device == "cuda":
-            loader_kwargs.update(num_workers=4, pin_memory=True)
+            loader_kwargs.update(
+                num_workers=getattr(config, "num_workers", 2),
+                pin_memory=True,
+            )
         self.data_loader = DataLoader(dataset, **loader_kwargs)
 
     def train(self, global_state_dict: OrderedDict) -> OrderedDict:
@@ -33,7 +37,10 @@ class FLClient:
             batch_size=self.config.batch_size, shuffle=True, drop_last=False,
         )
         if self.config.device == "cuda":
-            loader_kwargs.update(num_workers=4, pin_memory=True)
+            loader_kwargs.update(
+                num_workers=getattr(self.config, "num_workers", 2),
+                pin_memory=True,
+            )
         loader = DataLoader(dataset, **loader_kwargs)
         return self._do_train(global_state_dict, loader)
 
@@ -59,6 +66,14 @@ class FLClient:
         warmup_steps = max(1, int(total_steps * self.config.warmup_ratio))
 
         use_amp = self.config.device == "cuda"
+        amp_dtype = (
+            torch.bfloat16
+            if use_amp and torch.cuda.is_bf16_supported()
+            else torch.float16
+        )
+        scaler = torch.amp.GradScaler(
+            "cuda", enabled=use_amp and amp_dtype == torch.float16
+        )
         global_step = 0
         for _ in range(self.config.local_epochs):
             for batch in data_loader:
@@ -77,22 +92,37 @@ class FLClient:
                 optimizer.zero_grad()
 
                 if use_amp:
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    with torch.amp.autocast("cuda", dtype=amp_dtype):
                         loss = criterion(model(input_ids, attention_mask=attn_mask), y)
                 else:
                     loss = criterion(model(input_ids, attention_mask=attn_mask), y)
-                loss.backward()
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(
+                        f"client {self.client_id} produced a non-finite training loss"
+                    )
+                scaler.scale(loss).backward()
 
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     all_params, max_norm=self.config.max_grad_norm,
                 )
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 global_step += 1
 
-        # Compute delta on ALL parameters
+        # Compute a CPU delta on all parameters. Keeping the canonical FL
+        # state on CPU avoids mixed CPU/CUDA states during Shapley evaluation
+        # and prevents one GPU copy per participating client from accumulating.
         local_sd = model.state_dict()
         update = OrderedDict()
         for key in local_sd:
-            update[key] = local_sd[key].detach() - global_state_dict[key].to(
-                local_sd[key].device, dtype=local_sd[key].dtype)
+            delta = local_sd[key].detach() - global_state_dict[key].to(
+                local_sd[key].device, dtype=local_sd[key].dtype
+            )
+            update[key] = delta.cpu()
+        if use_amp:
+            del optimizer, model, all_params, local_sd, scaler, loss
+            del input_ids, attn_mask, y, batch
+            gc.collect()
+            torch.cuda.empty_cache()
         return update

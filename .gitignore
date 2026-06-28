@@ -10,6 +10,10 @@ venv/
 .env
 *.pt
 *.pth
+experiment.log
+results.zip
+pip_pkgs/
+tmp/
 
 model_cache/
 sklearn_data/

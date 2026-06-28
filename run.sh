@@ -3,10 +3,13 @@ set -e
 
 # ── 输出实时可见 ──────────────────────────────────────────────────────────────
 export PYTHONUNBUFFERED=1
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # ── 项目根目录 ─────────────────────────────────────────────────────────────────
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-$PROJECT_DIR/tmp/matplotlib}"
+mkdir -p "$MPLCONFIGDIR"
 
 # ── 1. 安装缺失的依赖 ────────────────────────────────────────────────────────
 PIP_PKGS="$PROJECT_DIR/pip_pkgs"
@@ -18,7 +21,7 @@ MISSING=""
 check_pkg() {
     local import_name="$1"
     local pip_name="$2"
-    python -c "import $import_name" 2>/dev/null || MISSING="$MISSING $pip_name"
+    "$PYTHON_BIN" -c "import $import_name" 2>/dev/null || MISSING="$MISSING $pip_name"
 }
 check_pkg torch         torch
 check_pkg transformers  transformers
@@ -34,8 +37,7 @@ if [ -n "$MISSING" ]; then
     echo "安装缺失的包:$MISSING"
     export TMPDIR="$PROJECT_DIR/tmp"
     mkdir -p "$TMPDIR"
-    rm -rf "$PIP_PKGS"
-    pip install $MISSING --target "$PIP_PKGS" --no-cache-dir \
+    "$PYTHON_BIN" -m pip install $MISSING --target "$PIP_PKGS" --no-cache-dir \
         -i https://pypi.tuna.tsinghua.edu.cn/simple
     echo "依赖安装完成"
 else
@@ -53,7 +55,7 @@ fi
 # ── 3. 运行实验 ───────────────────────────────────────────────────────────────
 echo ""
 echo "===== 启动实验 ====="
-python main.py
+"$PYTHON_BIN" -u main.py "$@"
 
 echo ""
 echo "===== 完成，结果保存在 results/ ====="

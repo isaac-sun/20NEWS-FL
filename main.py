@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Federated Learning on 20 Newsgroups — DistilBERT + LoRA
+Federated Learning on 20 Newsgroups — full DistilBERT fine-tuning
 Free-Rider Attacks + Per-Class Shapley Detection.
 
 Works on: Colab / school GPU platform / local machine.
@@ -15,6 +15,8 @@ Runs four experiments:
 
 import os
 import sys
+import argparse
+import gc
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 0. Bootstrap — earliest possible diagnostics, works everywhere
@@ -86,6 +88,11 @@ def _detect_device() -> str:
     if _FORCE in ("cpu",):
         return "cpu"
     if _FORCE in ("cuda", "gpu"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "FORCE_DEVICE=cuda was requested, but PyTorch cannot access CUDA. "
+                "Check the NVIDIA driver, CUDA-enabled PyTorch, or Colab runtime."
+            )
         return "cuda"
     try:
         if torch.cuda.is_available():
@@ -105,8 +112,7 @@ _stamp(f"  Device: {_DEVICE}")
 if _DEVICE == "cuda":
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision('high')       # TF32 on Ampere+
-    torch.cuda.amp.autocast.__default_dtype__ = torch.bfloat16
-    _stamp("  GPU opts: cudnn.benchmark + TF32 + bf16 autocast")
+    _stamp("  GPU opts: cudnn.benchmark + TF32")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 3. Project imports
@@ -116,6 +122,7 @@ _stamp("Importing project modules...")
 
 import copy
 import numpy as np
+from dataclasses import asdict
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
@@ -127,9 +134,16 @@ from models import FullDistilBERTClassifier as BERTModel, get_tokenizer
 from fl.client import FLClient
 from fl.server import FLServer
 from fl.aggregation import fedavg_aggregate
-from attacks.dfr import dfr_attack, estimate_dfr_sigma
+from attacks.dfr import dfr_attack, estimate_dfr_sigma, plain_free_rider_update
 from attacks.sdfr import sdfr_attack
-from attacks.afr import afr_attack, AFRState
+from attacks.afr import (
+    afr_attack,
+    estimate_decay_rate,
+    estimate_e_cos_beta,
+    estimate_c_from_norms,
+    global_update_norm,
+    update_norm,
+)
 from contribution.shapley import (
     estimate_round_shapley_per_class,
     per_class_to_overall,
@@ -139,6 +153,7 @@ from contribution.shapley import (
 from detection.utility_score import UtilityScoreTracker
 from utils.partition import iid_partition, non_iid_partition
 from utils.export import export_results
+from utils.runtime import require_cuda, resolve_gpu_profile
 
 _stamp("All imports OK")
 
@@ -148,44 +163,64 @@ logger = get_logger()
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
 def create_model(config):
-    """Create a full DistilBERT classifier (ALL params trainable, no LoRA)."""
+    """Create a full DistilBERT classifier with all parameters trainable."""
     return BERTModel(
         model_name=config.model_name,
         num_classes=config.num_classes,
+        model_dir=config.model_dir,
     )
 
 
 def _apply_attack(attack_type, global_sd, global_history, config,
-                  round_num=1, dfr_sigma_est=None,
-                  afr_state=None, val_loss_t=None):
+                  round_index=0, dfr_sigma_est=None, client_id=0,
+                  afr_c_est=None):
     """Generate a free-rider update (ALL parameters, full model)."""
     if attack_type == "dfr":
-        sigma = config.dfr_sigma
-        if config.dfr_estimate_sigma and dfr_sigma_est is not None:
+        sigma = config.dfr_sigma_override
+        if sigma is None:
             sigma = dfr_sigma_est
+        if sigma is None:
+            # theta(1)-theta(0) is not observable before the first aggregation.
+            return plain_free_rider_update(global_sd), {"dfr_sigma": None}
         update = dfr_attack(global_sd, sigma=sigma,
-                            round_num=round_num, gamma=config.dfr_gamma)
-        return update, {}
+                            round_num=round_index + 1, gamma=config.dfr_gamma)
+        return update, {"dfr_sigma": sigma}
     elif attack_type == "sdfr":
         update = sdfr_attack(global_sd, global_history)
         return update, {}
     elif attack_type == "afr":
-        if config.afr_e_cos_beta_override is not None:
-            e_cos_beta = config.afr_e_cos_beta_override
-        elif afr_state is not None and val_loss_t is not None:
-            e_cos_beta = afr_state.get_e_cos_beta(val_loss_t)
-        mean_base_norm = None
-        if afr_state is not None:
-            mean_base_norm = afr_state.get_mean_base_norm()
+        afr_c = config.afr_c_override
+        if afr_c is None:
+            afr_c = afr_c_est
+        if afr_c is None:
+            raise RuntimeError("AFR C was not estimated during honest warm-up")
+        first_norm = global_update_norm(global_history[1], global_history[0])
+        current_norm = global_update_norm(global_sd, global_history[-1])
+        decay_rate = estimate_decay_rate(
+            current_norm, first_norm, round_num=round_index
+        )
+        e_cos_beta = estimate_e_cos_beta(
+            afr_c, decay_rate, round_num=round_index
+        )
         update, base_norm = afr_attack(
             global_sd, global_history,
             n_total=config.num_clients,
             e_cos_beta=e_cos_beta,
-            mean_base_norm=mean_base_norm,
             noisy_frac=config.afr_noisy_frac,
+            seed=config.seed + round_index * config.num_clients + client_id,
         )
-        return update, {"afr_base_norm": base_norm}
+        return update, {
+            "afr_base_norm": base_norm,
+            "afr_decay_rate": decay_rate,
+            "afr_e_cos_beta": e_cos_beta,
+        }
     raise ValueError(f"Unknown attack type: {attack_type}")
+
+
+def _assert_finite_update(update, label: str):
+    for key, value in update.items():
+        if not torch.isfinite(value).all():
+            raise FloatingPointError(f"{label} contains non-finite values in {key}")
 
 
 # ─── single experiment ───────────────────────────────────────────────────────
@@ -198,6 +233,12 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
         f"=== Experiment: {config.experiment_name} | "
         f"Attack: {config.attack_type} ==="
     )
+    if config.attack_type in {"sdfr", "afr"} and config.participation_ratio != 1.0:
+        raise ValueError(
+            "SDFR/AFR paper alignment requires participation_ratio=1.0"
+        )
+    if config.attack_warmup_rounds < 2:
+        raise ValueError("SDFR/AFR require at least two warm-up rounds")
 
     # ── data partitioning ────────────────────────────────────────────────
     if config.iid:
@@ -246,16 +287,21 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
         for cid in range(config.num_clients)
     }
 
-    # ── attack state trackers ───────────────────────────────────────────
+    # DFR sigma becomes observable after theta(1)-theta(0) exists.
     dfr_sigma_est = None
-    afr_state = AFRState(ema_alpha=config.afr_base_norm_ema_alpha) if config.attack_type == "afr" else None
+    afr_c_est = None
+    last_warmup_mean_local_norm = None
 
-    val_loader = DataLoader(val_dataset, batch_size=config.eval_batch_size)
+    val_loader_kwargs = {"batch_size": config.eval_batch_size}
+    if config.device == "cuda":
+        val_loader_kwargs.update(
+            num_workers=config.num_workers,
+            pin_memory=True,
+        )
+    val_loader = DataLoader(val_dataset, **val_loader_kwargs)
     eval_model = model_fn()
-    # NOTE: torch.compile with reduce-overhead caches parameters at graph
-    # capture time, causing load_lora_state_dict changes to be invisible —
-    # all Shapley values compute to zero.  Disabled until a compile-safe
-    # approach is available; overhead is ~15-20 % slower Shapley estimation.
+    # torch.compile is intentionally disabled: the evaluation model's full
+    # state dict changes for every sampled coalition.
     # if config.device == "cuda":
     #     try:
     #         eval_model = torch.compile(eval_model, mode="reduce-overhead")
@@ -265,53 +311,62 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
 
     # ── FL rounds ────────────────────────────────────────────────────────
     for round_t in tqdm(range(config.num_rounds), desc=config.experiment_name):
-        # Round-level cosine LR decay (global curriculum)
-        config.local_lr = config.get_round_local_lr(round_t)
-
         selected = server.select_clients(
             config.num_clients, config.participation_ratio
         )
         global_sd = server.get_global_state_dict()
         global_history = list(server.global_history)
 
+        if (config.attack_type == "afr" and afr_c_est is None
+                and config.afr_c_override is None
+                and round_t >= config.attack_warmup_rounds):
+            first_norm = global_update_norm(global_history[1], global_history[0])
+            current_norm = global_update_norm(global_sd, global_history[-1])
+            decay_rate = estimate_decay_rate(
+                current_norm, first_norm, round_num=round_t
+            )
+            afr_c_est = estimate_c_from_norms(
+                last_warmup_mean_local_norm,
+                current_norm,
+                config.num_clients,
+                decay_rate,
+                round_num=round_t - 1,
+            )
+            logger.info(f"AFR C estimated from warm-up updates: {afr_c_est:.6f}")
+
         # ── pre-attack: DFR sigma estimation ─────────────────────────
-        if config.attack_type == "dfr" and dfr_sigma_est is None and config.dfr_estimate_sigma:
+        if (config.attack_type == "dfr" and dfr_sigma_est is None
+                and config.dfr_sigma_override is None):
             est = estimate_dfr_sigma(global_sd, global_history)
             if est is not None:
                 dfr_sigma_est = est
                 logger.info(f"DFR sigma auto-estimated: {dfr_sigma_est:.6f}")
 
-        # ── pre-attack: validation loss for AFR state ────────────────────
-        val_loss_t = None
-        if config.attack_type == "afr":
-            val_loss_t, _ = server.evaluate_val()
-            if afr_state is not None and afr_state.val_loss_init is None:
-                afr_state.val_loss_init = val_loss_t
-                logger.info(f"AFR val_loss_init set: {val_loss_t:.4f}")
-
         # collect updates
         updates = {}
-        afr_base_norms_this_round = []
         for cid in selected:
             participation_counts[cid] += 1
-            if cid in malicious_ids:
+            needs_honest_warmup = (
+                config.attack_type in {"sdfr", "afr"}
+                and round_t < config.attack_warmup_rounds
+            )
+            if cid in malicious_ids and not needs_honest_warmup:
                 update, meta = _apply_attack(
                     config.attack_type, global_sd, global_history, config,
-                    round_num=round_t + 1,
+                    round_index=round_t,
                     dfr_sigma_est=dfr_sigma_est,
-                    afr_state=afr_state,
-                    val_loss_t=val_loss_t,
+                    client_id=cid,
+                    afr_c_est=afr_c_est,
                 )
                 updates[cid] = update
-                if "afr_base_norm" in meta:
-                    afr_base_norms_this_round.append(meta["afr_base_norm"])
             else:
                 updates[cid] = clients[cid].train(global_sd)
+            _assert_finite_update(updates[cid], f"client {cid} update")
 
-        # ── post-attack: update AFR state ────────────────────────────────
-        if afr_state is not None and val_loss_t is not None and afr_base_norms_this_round:
-            avg_base_norm = float(np.mean(afr_base_norms_this_round))
-            afr_state.update(val_loss_t, avg_base_norm)
+        if config.attack_type == "afr" and needs_honest_warmup:
+            last_warmup_mean_local_norm = float(np.mean([
+                update_norm(updates[cid]) for cid in selected
+            ]))
 
         # ── per-class Shapley estimation ─────────────────────────────────
         round_sample_counts = {cid: client_sample_counts[cid] for cid in selected}
@@ -329,13 +384,14 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
         # ── utility scores ───────────────────────────────────────────────
         utility_tracker.update(shapley_vals)
 
-        # ── aggregate (FedAvg with optional server momentum) ────────────
-        new_sd, server.momentum_buffer = fedavg_aggregate(
-            global_sd, updates,
-            server_lr=server.current_server_lr,
-            momentum=config.server_momentum,
-            momentum_buffer=server.momentum_buffer,
+        # ── standard sample-size-weighted FedAvg ────────────────────────
+        aggregation_weights = {
+            cid: client_sample_counts[cid] for cid in selected
+        }
+        new_sd = fedavg_aggregate(
+            global_sd, updates, weights=aggregation_weights,
         )
+        _assert_finite_update(new_sd, "aggregated global state")
         server.update_global_model(new_sd)
 
         # ── evaluate ─────────────────────────────────────────────────────
@@ -442,31 +498,76 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
 
 
 # ─── main ────────────────────────────────────────────────────────────────────
-def main():
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Full-DistilBERT federated free-rider experiments"
+    )
+    parser.add_argument(
+        "--gpu-profile",
+        choices=("auto", "t4", "large"),
+        default="auto",
+        help="GPU memory profile; auto selects from detected VRAM",
+    )
+    parser.add_argument(
+        "--require-cuda",
+        action="store_true",
+        help="fail immediately unless an NVIDIA CUDA device is available",
+    )
+    parser.add_argument(
+        "--results-dir",
+        default="results",
+        help="directory for Excel results and plots",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    require_cuda(args.require_cuda, _DEVICE)
+
+    gpu_name = ""
+    gpu_memory_gb = 0.0
+    resolved_profile = None
+    if _DEVICE == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory_gb = (
+            torch.cuda.get_device_properties(0).total_memory / 1024**3
+        )
+        resolved_profile = resolve_gpu_profile(args.gpu_profile, gpu_memory_gb)
+
     base = Config(
         model_dir=os.environ.get("MODEL_DIR", ""),
         num_rounds=50,
         local_epochs=2,
         num_clients=10,
-        local_lr=0.0005,
-        server_lr=0.7,
-        participation_ratio=0.8,
-        batch_size=32,
+        local_lr=2e-5,
+        participation_ratio=1.0,
+        batch_size=resolved_profile.train_batch_size if resolved_profile else 8,
+        eval_batch_size=resolved_profile.eval_batch_size if resolved_profile else 64,
+        num_workers=resolved_profile.num_workers if resolved_profile else 0,
         num_classes=20,
         val_ratio=0.1,
         iid=True,
         malicious_ratio=0.4,
         num_mc_samples=15,
         seed=42,
-        results_dir="results",
+        results_dir=args.results_dir,
+        gpu_profile=resolved_profile.name if resolved_profile else "cpu",
+        gpu_name=gpu_name,
+        gpu_memory_gb=gpu_memory_gb,
     )
     base.device = _DEVICE  # use the safely-detected device
     _stamp(f"Config OK — device: {base.device}")
 
     logger.info(f"Using device: {base.device}")
     if base.device == "cuda":
-        logger.info(f"GPU: {torch.cuda.get_device_name(0)} | "
-                    f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        amp_dtype = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+        logger.info(
+            f"GPU: {base.gpu_name} | VRAM: {base.gpu_memory_gb:.1f} GB | "
+            f"profile={base.gpu_profile} | train_batch={base.batch_size} | "
+            f"eval_batch={base.eval_batch_size} | workers={base.num_workers} | "
+            f"AMP={amp_dtype}"
+        )
 
     # ── load data once ───────────────────────────────────────────────────
     _stamp("Loading 20 Newsgroups data...")
@@ -516,6 +617,9 @@ def main():
         all_pc_records.extend(pc_records)
         all_cum_pc_sv[exp_name] = cum_pc_sv
         _stamp(f"  Done: {exp_name} — final acc={summary['final_global_accuracy']:.4f}")
+        gc.collect()
+        if base.device == "cuda":
+            torch.cuda.empty_cache()
 
     # ── mark attack effectiveness (relative to baseline) ─────────────────
     baseline_acc = all_summaries[0]["final_global_accuracy"]
@@ -527,7 +631,8 @@ def main():
     # ── export ───────────────────────────────────────────────────────────
     os.makedirs(base.results_dir, exist_ok=True)
     filepath = export_results(all_details, all_summaries, base.results_dir,
-                              per_class_records=all_pc_records)
+                              per_class_records=all_pc_records,
+                              experiment_config=asdict(base))
     logger.info(f"Excel results exported to {filepath}")
     _stamp(f"Excel exported: {filepath}")
 

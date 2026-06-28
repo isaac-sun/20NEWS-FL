@@ -1,88 +1,83 @@
-import math
-
-import torch
 from collections import OrderedDict
-from typing import List, Optional, Tuple
+from typing import List, Tuple
+
+import math
+import torch
 
 from attacks.sdfr import sdfr_attack
 
 
-# ── Paper-faithful estimation helpers ──────────────────────────────────────
-
-def estimate_e_cos_beta(val_loss_t: float, val_loss_init: float) -> float:
+def estimate_decay_rate(
+    update_norm_t: float,
+    update_norm_1: float,
+    round_num: int,
+    eps: float = 1e-12,
+) -> float:
     """
-    Estimate E[cos β] from the validation-loss trajectory.
+    Estimate the positive OU decay rate from Zhu et al. Algorithm 1.
 
-    From [12] (Zhu et al.), the gradient alignment metric λ̄ is related to
-    the pairwise cosine similarity of honest client updates by:
-
-        λ̄ = (1 + (n−1)·E[cos β]) / n
-
-    Under a convergence model where λ̄ tracks the loss ratio:
-
-        λ̄(t) ≈ 1/n + (1 − 1/n) · (1 − l(t)/l(1))
-
-    Solving for E[cos β] gives:
-
-        E[cos β](t) = 1 − l(t)/l(1)
-
-    Interpretation:
-        • At round 1:  l(t) ≈ l(1) → E[cos β] ≈ 0  (uncorrelated updates)
-        • Converged:   l(t) → 0   → E[cos β] → 1    (highly aligned updates)
-
-    Parameters
-    ----------
-    val_loss_t : validation loss of the global model at current round.
-    val_loss_init : validation loss of the global model at round 0 (before
-        any training).
+    The paper estimates the rate from ``l(t)=|E(theta(t)-theta(t-1))|``
+    and ``l(1)``. Its typeset pseudocode omits the minus sign even though
+    Lemma 1 and the surrounding derivation require decay ``exp(-lambda*t)``.
+    This implementation uses the mathematically consistent form
+    ``-log(l(t)/l(1)) / (t-1)``.
     """
-    if val_loss_init is None or val_loss_init < 1e-10:
+    if round_num <= 1 or update_norm_1 <= eps or update_norm_t <= eps:
         return 0.0
-    ratio = val_loss_t / val_loss_init
-    return max(0.0, min(1.0 - ratio, 0.99))
+    ratio = max(update_norm_t / update_norm_1, eps)
+    return max(-math.log(ratio) / (round_num - 1), 0.0)
 
 
-class AFRState:
+def estimate_e_cos_beta(c: float, decay_rate: float, round_num: int) -> float:
+    """Zhu et al. Lemma 1: E[cos beta] = C^2/(C^2+exp(2*lambda*t))."""
+    if c <= 0:
+        raise ValueError("AFR constant C must be positive")
+    exponent = min(2.0 * max(decay_rate, 0.0) * max(round_num, 0), 700.0)
+    c_sq = c * c
+    return c_sq / (c_sq + math.exp(exponent))
+
+
+def global_update_norm(
+    global_state_dict: OrderedDict,
+    previous_state_dict: OrderedDict,
+) -> float:
+    """Compute ||theta(t)-theta(t-1)|| without flattening the full model."""
+    norm_sq = 0.0
+    for key in global_state_dict:
+        delta = global_state_dict[key].float() - previous_state_dict[key].float()
+        norm_sq += delta.pow(2).sum().item()
+    return math.sqrt(norm_sq)
+
+
+def update_norm(update: OrderedDict) -> float:
+    """Compute an update's L2 norm without flattening the model."""
+    return math.sqrt(sum(
+        value.float().pow(2).sum().item() for value in update.values()
+    ))
+
+
+def estimate_c_from_norms(
+    local_update_norm: float,
+    mean_update_norm: float,
+    n_total: int,
+    decay_rate: float,
+    round_num: int,
+    eps: float = 1e-8,
+) -> float:
+    """Estimate C by combining Zhu et al. Lemmas 1 and 2.
+
+    Lemma 2 recovers E[cos beta] from ``||U_i|| / ||U_bar||`` during an
+    honest warm-up round. Lemma 1 then yields C.
     """
-    Track running statistics for paper-faithful AFR noise calibration.
-
-    Maintains two quantities across rounds:
-
-    1. **val_loss_init** — the initial validation loss l(1) for
-       E[cos β](t) = 1 − l(t)/l(1).
-
-    2. **base_norm_ema** — exponential moving average (EMA) of
-       ||U_f(θ)||, used as the paper's |E[U_f(θ)]|.
-
-       The paper formula uses |E[U_f(θ)]| (the norm of the *expected*
-       free-rider update), not the single-round instance norm.  Because
-       U_f is deterministic given global model history, the expectation is
-       over the stochastic training process (client sampling, local SGD).
-       We approximate it with an EMA of past SDFR output norms.
-    """
-
-    def __init__(self, ema_alpha: float = 0.3):
-        self.val_loss_init: Optional[float] = None
-        self.base_norm_ema: Optional[float] = None
-        self.ema_alpha = ema_alpha
-
-    def update(self, val_loss_t: float, base_norm_t: float):
-        """Update tracked quantities after each round."""
-        if self.val_loss_init is None:
-            self.val_loss_init = val_loss_t
-        if self.base_norm_ema is None:
-            self.base_norm_ema = base_norm_t
-        else:
-            a = self.ema_alpha
-            self.base_norm_ema = a * base_norm_t + (1 - a) * self.base_norm_ema
-
-    def get_e_cos_beta(self, val_loss_t: float) -> float:
-        """Estimate E[cos β] from current-round validation loss."""
-        return estimate_e_cos_beta(val_loss_t, self.val_loss_init)
-
-    def get_mean_base_norm(self) -> Optional[float]:
-        """Return EMA of ||U_f(θ)||, or None if no history yet."""
-        return self.base_norm_ema
+    if n_total < 2 or local_update_norm <= eps or mean_update_norm <= eps:
+        raise ValueError("positive warm-up update norms are required to estimate C")
+    norm_ratio_sq = (local_update_norm / mean_update_norm) ** 2
+    n = float(n_total)
+    cosine = ((n * n) / norm_ratio_sq - n) / (n * n - n)
+    cosine = min(max(cosine, eps), 1.0 - eps)
+    exponent = min(2.0 * max(decay_rate, 0.0) * max(round_num, 0), 700.0)
+    c_sq = cosine * math.exp(exponent) / (1.0 - cosine)
+    return math.sqrt(c_sq)
 
 
 # ── AFR attack ─────────────────────────────────────────────────────────────
@@ -92,88 +87,42 @@ def afr_attack(
     global_history: List[OrderedDict],
     n_total: int = 10,
     e_cos_beta: float = 0.0,
-    mean_base_norm: Optional[float] = None,
     noisy_frac: float = 0.1,
-    seed: Optional[int] = None,
+    seed: int | None = None,
     eps: float = 1e-10,
-    trainable_keys: list = None,
 ) -> Tuple[OrderedDict, float]:
     """
-    Advanced Free-Rider (AFR) — Zhu et al. [12], SVRFL Sec. 4.
+    Advanced free-rider attack from Zhu et al. Algorithm 1.
 
-    Extends SDFR by adding calibrated sparse Gaussian noise so that the
-    cosine similarity between the AFR update and honest updates stays
-    plausible.
+    It augments the scaled-delta update with sparse Gaussian noise:
 
-    Paper formula for noise magnitude:
-        |φ(t)| = sqrt( n² / (n + (n²−n)·E[cos β]) − 1 ) · |E[U_f(θ)]|
+        |phi(t)| = sqrt(n^2 / (n + (n^2-n)E[cos beta]) - 1) * |U_f|
 
-    Noise is applied to d randomly selected coordinates only:
-        z_i ~ N(0, φ(t)² / d)   for each selected coordinate
-        z_i  = 0                 elsewhere
-    This yields ||z|| ≈ |φ(t)| regardless of d.
-
-    Symbols → code:
-        n            → n_total  (total number of clients in the FL system;
-                        the paper derives the formula from the full
-                        population of n honest updates, not the per-round
-                        subset)
-        D            → total_dim  (total model parameters)
-        d            → num_noisy = int(D · noisy_frac)
-        E[cos β]     → e_cos_beta  (estimated via estimate_e_cos_beta()
-                        or AFRState from the validation-loss trajectory)
-        |E[U_f(θ)]|  → mean_base_norm  (EMA of past SDFR output norms;
-                        if None, falls back to single-round ||U_f(θ)||)
-        U_f(θ)       → base_update from sdfr_attack()
-        φ(t)         → phi_t
-
-    Parameters
-    ----------
-    global_state_dict : current global model θ(t).
-    global_history : list of past global states.
-    n_total : total number of clients in the FL system.  The paper uses n
-        to denote the full population size, not the per-round participants.
-    e_cos_beta : estimated expected pairwise cosine similarity between
-        honest updates.  Should be computed via estimate_e_cos_beta() or
-        AFRState.get_e_cos_beta(), NOT kept as a fixed constant.
-    mean_base_norm : EMA of ||U_f(θ)|| from past rounds, approximating
-        |E[U_f(θ)]|.  If None, falls back to single-round ||U_f(θ)||.
-    noisy_frac : fraction of model parameters to perturb (d / D).
-    seed : optional RNG seed for reproducible coordinate selection.
-    eps : numerical stability constant.
-
-    Returns
-    -------
-    update : the AFR fake update (OrderedDict matching model structure).
-    base_norm : ||U_f(θ)|| for this round (caller should feed this back
-        into AFRState.update() for EMA tracking).
+    Selected coordinates receive ``|phi(t)| * N(0, 1/d)``. Bernoulli
+    selection is used tensor-by-tensor to avoid allocating a 66-million
+    element permutation solely to select ``d`` coordinates. Its expected
+    selected dimension is exactly ``D * noisy_frac``.
     """
-    # ── Step 1: SDFR base update (on trainable params only) ────────────
-    base_update = sdfr_attack(global_state_dict, global_history, eps=eps,
-                               trainable_keys=trainable_keys)
+    if n_total < 2:
+        raise ValueError("AFR requires at least two clients")
+    if not 0.0 < noisy_frac <= 1.0:
+        raise ValueError("noisy_frac must be in (0, 1]")
+    if not 0.0 <= e_cos_beta <= 1.0:
+        raise ValueError("e_cos_beta must be in [0, 1]")
 
-    # ── Step 2: flatten only trainable params into a single vector ──────
-    use_keys = trainable_keys if trainable_keys is not None else list(base_update.keys())
-    shapes = [base_update[k].shape for k in use_keys]
-    flat_base = torch.cat([base_update[k].flatten() for k in use_keys])
-    total_dim = flat_base.numel()                       # D
+    base_update = sdfr_attack(global_state_dict, global_history, eps=eps)
+    total_dim = sum(value.numel() for value in base_update.values())
+    base_norm_sq = sum(
+        value.float().pow(2).sum().item() for value in base_update.values()
+    )
+    base_norm = math.sqrt(base_norm_sq)
 
-    # ── Step 3: compute norms ───────────────────────────────────────────
-    base_norm = flat_base.float().norm().item()         # ||U_f(θ)|| this round
-
-    # |E[U_f(θ)]|: use EMA from past rounds if available;
-    # otherwise fall back to single-round ||U_f(θ)||.
-    effective_base_norm = mean_base_norm if mean_base_norm is not None else base_norm
-
-    # ── Step 4: compute noise magnitude |φ(t)| ─────────────────────────
-    n = max(n_total, 2)
+    n = n_total
     denom = n + (n * n - n) * e_cos_beta
-    ratio = (n * n) / (denom + eps)
-    phi_t_sq = max(ratio - 1.0, 0.0) * (effective_base_norm ** 2)
-    phi_t = math.sqrt(phi_t_sq)
-
-    # ── Step 5: select d random coordinates ─────────────────────────────
-    num_noisy = max(int(total_dim * noisy_frac), 1)     # d
+    multiplier_sq = max((n * n) / (denom + eps) - 1.0, 0.0)
+    phi_t = math.sqrt(multiplier_sq) * base_norm
+    expected_noisy = max(int(total_dim * noisy_frac), 1)
+    noise_std = phi_t / math.sqrt(expected_noisy)
 
     gen = torch.Generator()
     if seed is not None:
@@ -181,27 +130,11 @@ def afr_attack(
     else:
         gen.manual_seed(torch.randint(0, 2**31, (1,)).item())
 
-    indices = torch.randperm(total_dim, generator=gen)[:num_noisy]
-
-    # ── Step 6: sparse noise  z ~ N(0, φ²/d) on selected coords ───────
-    noise_std = phi_t / math.sqrt(num_noisy)
-    noise_values = torch.randn(num_noisy, generator=gen).to(
-        dtype=flat_base.dtype, device=flat_base.device
-    ) * noise_std
-
-    flat_noise = torch.zeros_like(flat_base)
-    flat_noise[indices] = noise_values
-
-    # ── Step 7: reconstruct update dict ─────────────────────────────────
-    flat_result = flat_base + flat_noise
-
     update = OrderedDict()
-    offset = 0
-    for k, shape in zip(use_keys, shapes):
-        numel = 1
-        for s in shape:
-            numel *= s
-        update[k] = flat_result[offset:offset + numel].reshape(shape)
-        offset += numel
+    for key, value in base_update.items():
+        selection = torch.rand(value.shape, generator=gen) < noisy_frac
+        noise = torch.randn(value.shape, dtype=value.dtype, generator=gen)
+        noise.mul_(noise_std).mul_(selection)
+        update[key] = value + noise
 
     return update, base_norm

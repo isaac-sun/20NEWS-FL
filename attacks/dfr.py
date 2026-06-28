@@ -1,49 +1,70 @@
-import torch
 from collections import OrderedDict
 from typing import List, Optional
+
+import torch
 
 
 def estimate_dfr_sigma(
     global_state_dict: OrderedDict,
     global_history: List[OrderedDict],
-    trainable_keys: list = None,
 ) -> Optional[float]:
     """
-    Estimate DFR sigma from the first observed global model delta,
-    computed only over trainable parameters.
+    Estimate DFR sigma from the first observed global-model increment.
+
+    Fraboni et al. fit a zero-centred univariate Gaussian to
+    ``theta(1) - theta(0)`` and use its standard deviation as sigma.
+    ``global_history`` contains states before the current global state.
     """
     if len(global_history) < 1:
         return None
 
-    w_init = global_history[0]
-    w_after_first = global_history[1] if len(global_history) >= 2 else global_state_dict
-    keys = trainable_keys if trainable_keys is not None else list(w_init.keys())
+    theta_0 = global_history[0]
+    theta_1 = global_history[1] if len(global_history) >= 2 else global_state_dict
 
     delta_flat = torch.cat([
-        (w_after_first[k].float() - w_init[k].float()).flatten()
-        for k in keys
+        (theta_1[k].float() - theta_0[k].float()).reshape(-1).cpu()
+        for k in theta_0
     ])
-    return delta_flat.std().item()
+    # The fitted Gaussian uses the population standard deviation.
+    return delta_flat.std(unbiased=False).item()
 
 
 def dfr_attack(
     global_state_dict: OrderedDict,
-    sigma: float = 0.5,
+    sigma: float,
     round_num: int = 1,
     gamma: float = 1.0,
-    trainable_keys: list = None,
+    generator: torch.Generator | None = None,
 ) -> OrderedDict:
     """
-    Disguised Free-Rider (DFR) — Fraboni et al. [11], SVRFL Sec. 4.
+    Disguised free-rider update from Fraboni et al.
 
-    Generates Gaussian noise only for trainable (LoRA + head) parameters.
-    The frozen backbone params always have delta=0 (not transmitted).
+        delta_f^t = phi(t) * epsilon_t
+        phi(t) = sigma * t^(-gamma),  epsilon_t ~ N(0, I)
 
-    If trainable_keys is None, generates noise for all keys (backward compat).
+    The returned object is a model delta, equivalent to uploading
+    ``theta^t + delta_f^t``. All tensors are kept on the canonical state
+    device (CPU in this project).
     """
+    if sigma < 0:
+        raise ValueError("sigma must be non-negative")
+    if gamma < 0:
+        raise ValueError("gamma must be non-negative")
+
     phi_t = sigma * (max(round_num, 1) ** (-gamma))
-    keys = trainable_keys if trainable_keys is not None else list(global_state_dict.keys())
     update = OrderedDict()
-    for key in keys:
-        update[key] = torch.randn_like(global_state_dict[key]) * phi_t
+    for key, value in global_state_dict.items():
+        noise = torch.randn(
+            value.shape,
+            dtype=value.dtype,
+            device=value.device,
+            generator=generator,
+        )
+        update[key] = noise * phi_t
     return update
+
+
+def plain_free_rider_update(global_state_dict: OrderedDict) -> OrderedDict:
+    """Return the zero delta used while DFR sigma is not observable yet."""
+    return OrderedDict((key, torch.zeros_like(value))
+                       for key, value in global_state_dict.items())
