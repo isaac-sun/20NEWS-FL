@@ -95,9 +95,7 @@ def _evaluate_per_class_loss(
 
     Returns ndarray of shape (num_classes,).
     """
-    # Load trainable params only (frozen backbone stays from model init)
-    from models.lora_classifier import load_lora_state_dict
-    load_lora_state_dict(model, state_dict)
+    model.load_state_dict(state_dict, strict=True)
     model.to(device)
     model.eval()
     criterion = nn.CrossEntropyLoss(reduction="none")

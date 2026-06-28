@@ -39,23 +39,15 @@ class FLClient:
 
     def _do_train(self, global_state_dict: OrderedDict,
                   data_loader) -> OrderedDict:
-        """Core local training loop.
-
-        Optimizations:
-          - Label smoothing → better generalization for 20-class
-          - Linear warmup + linear decay → stabilizes transformer fine-tuning
-          - Gradient clipping → prevents instability
-          - bf16 autocast (CUDA only) → faster training
-        """
+        """Core local training loop — full model, all params trainable."""
         model = self.model_fn()
-        from models.lora_classifier import load_lora_state_dict
-        load_lora_state_dict(model, global_state_dict)
+        model.load_state_dict(global_state_dict, strict=True)
         model.to(self.config.device)
         model.train()
 
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        all_params = list(model.parameters())
         optimizer = torch.optim.AdamW(
-            trainable_params,
+            all_params,
             lr=self.config.local_lr,
             weight_decay=self.config.weight_decay,
         )
@@ -70,9 +62,7 @@ class FLClient:
         global_step = 0
         for _ in range(self.config.local_epochs):
             for batch in data_loader:
-                # ── Linear warmup + linear decay per-step LR ─────────────
                 if global_step < warmup_steps:
-                    # +1 avoids LR=0 on the first step (global_step=0)
                     lr = self.config.local_lr * (global_step + 1) / max(warmup_steps, 1)
                 else:
                     progress = (global_step - warmup_steps) / max(total_steps - warmup_steps, 1)
@@ -93,21 +83,16 @@ class FLClient:
                     loss = criterion(model(input_ids, attention_mask=attn_mask), y)
                 loss.backward()
 
-                # ── Gradient clipping ────────────────────────────────────
                 torch.nn.utils.clip_grad_norm_(
-                    trainable_params,
-                    max_norm=self.config.max_grad_norm,
+                    all_params, max_norm=self.config.max_grad_norm,
                 )
-
                 optimizer.step()
                 global_step += 1
 
-        # Compute update: delta for trainable params only
-        trainable_keys = model.trainable_keys
-        local_trainable_sd = model.get_trainable_state_dict()
+        # Compute delta on ALL parameters
+        local_sd = model.state_dict()
         update = OrderedDict()
-        for key in trainable_keys:
-            update[key] = local_trainable_sd[key] - global_state_dict[key].to(
-                local_trainable_sd[key].device, dtype=local_trainable_sd[key].dtype)
-
+        for key in local_sd:
+            update[key] = local_sd[key].detach() - global_state_dict[key].to(
+                local_sd[key].device, dtype=local_sd[key].dtype)
         return update

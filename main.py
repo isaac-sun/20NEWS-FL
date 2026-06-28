@@ -123,7 +123,7 @@ from config import Config
 from utils.seed import set_seed
 from utils.logger import get_logger
 from data.newsgroups import load_newsgroups
-from models.lora_classifier import DistilBERTWithLoRA
+from models import FullDistilBERTClassifier as BERTModel, get_tokenizer
 from fl.client import FLClient
 from fl.server import FLServer
 from fl.aggregation import fedavg_aggregate
@@ -147,37 +147,29 @@ logger = get_logger()
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
-def create_model(input_dim, config):
-    """Create a DistilBERTWithLoRA model."""
-    return DistilBERTWithLoRA(
+def create_model(config):
+    """Create a full DistilBERT classifier (ALL params trainable, no LoRA)."""
+    return BERTModel(
         model_name=config.model_name,
         num_classes=config.num_classes,
-        lora_r=config.lora_r,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        model_dir=config.model_dir,
-    ).to(config.device)
+    )
 
 
 def _apply_attack(attack_type, global_sd, global_history, config,
                   round_num=1, dfr_sigma_est=None,
-                  afr_state=None, val_loss_t=None,
-                  trainable_keys=None):
-    """Generate a free-rider update (trainable params only)."""
+                  afr_state=None, val_loss_t=None):
+    """Generate a free-rider update (ALL parameters, full model)."""
     if attack_type == "dfr":
         sigma = config.dfr_sigma
         if config.dfr_estimate_sigma and dfr_sigma_est is not None:
             sigma = dfr_sigma_est
         update = dfr_attack(global_sd, sigma=sigma,
-                            round_num=round_num, gamma=config.dfr_gamma,
-                            trainable_keys=trainable_keys)
+                            round_num=round_num, gamma=config.dfr_gamma)
         return update, {}
     elif attack_type == "sdfr":
-        update = sdfr_attack(global_sd, global_history,
-                              trainable_keys=trainable_keys)
+        update = sdfr_attack(global_sd, global_history)
         return update, {}
     elif attack_type == "afr":
-        e_cos_beta = 0.0
         if config.afr_e_cos_beta_override is not None:
             e_cos_beta = config.afr_e_cos_beta_override
         elif afr_state is not None and val_loss_t is not None:
@@ -191,7 +183,6 @@ def _apply_attack(attack_type, global_sd, global_history, config,
             e_cos_beta=e_cos_beta,
             mean_base_norm=mean_base_norm,
             noisy_frac=config.afr_noisy_frac,
-            trainable_keys=trainable_keys,
         )
         return update, {"afr_base_norm": base_norm}
     raise ValueError(f"Unknown attack type: {attack_type}")
@@ -223,9 +214,8 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
     }
 
     # ── model / server / clients ─────────────────────────────────────────
-    model_fn = lambda: create_model(input_dim, config)
+    model_fn = lambda: create_model(config)
     model = model_fn()
-    trainable_keys = model.trainable_keys
 
     server = FLServer(model, val_dataset, test_dataset, config)
 
@@ -286,7 +276,7 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
 
         # ── pre-attack: DFR sigma estimation ─────────────────────────
         if config.attack_type == "dfr" and dfr_sigma_est is None and config.dfr_estimate_sigma:
-            est = estimate_dfr_sigma(global_sd, global_history, trainable_keys=trainable_keys)
+            est = estimate_dfr_sigma(global_sd, global_history)
             if est is not None:
                 dfr_sigma_est = est
                 logger.info(f"DFR sigma auto-estimated: {dfr_sigma_est:.6f}")
@@ -311,7 +301,6 @@ def run_experiment(config, train_dataset, val_dataset, test_dataset,
                     dfr_sigma_est=dfr_sigma_est,
                     afr_state=afr_state,
                     val_loss_t=val_loss_t,
-                    trainable_keys=trainable_keys,
                 )
                 updates[cid] = update
                 if "afr_base_norm" in meta:

@@ -21,8 +21,7 @@ class FLServer:
     def __init__(self, model, val_dataset, test_dataset, config):
         self.model = model
         self.config = config
-        # Store only trainable (LoRA + head) params
-        self.global_state_dict = model.get_trainable_state_dict()
+        self.global_state_dict = model.get_state_dict()
         # Sliding window of up to 3 previous global state dicts
         self.global_history: deque = deque(maxlen=3)
         # Server momentum buffer (only used when config.server_momentum > 0)
@@ -41,7 +40,6 @@ class FLServer:
         return selected
 
     def get_global_state_dict(self) -> OrderedDict:
-        """Return a clone of the current trainable state dict."""
         return OrderedDict(
             {k: v.clone() for k, v in self.global_state_dict.items()}
         )
@@ -58,8 +56,7 @@ class FLServer:
         self.global_state_dict = OrderedDict(
             {k: v.clone() for k, v in new_state_dict.items()}
         )
-        # Load trainable params into model
-        self.model.load_trainable_state_dict(self.global_state_dict)
+        self.model.load_state_dict_from(self.global_state_dict)
 
         # ── Apply server learning rate decay ────────────────────────────
         if self.config.server_lr_decay < 1.0:
@@ -68,10 +65,10 @@ class FLServer:
 
     def evaluate(self):
         """Evaluate global model on test set. Returns (loss, accuracy)."""
-        self.model.load_trainable_state_dict(self.global_state_dict)
+        self.model.load_state_dict_from(self.global_state_dict)
         return evaluate_model(self.model, self.test_loader, self.config.device)
 
     def evaluate_val(self):
         """Evaluate global model on validation set. Returns (loss, accuracy)."""
-        self.model.load_trainable_state_dict(self.global_state_dict)
+        self.model.load_state_dict_from(self.global_state_dict)
         return evaluate_model(self.model, self.val_loader, self.config.device)
